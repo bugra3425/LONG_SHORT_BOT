@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 # ⚙️ AYARLAR
 # ==========================================
 DATA_FOLDER = "backtest_data"
-DAYS_TO_FETCH = 30          # 1 ay
+DAYS_TO_FETCH = 60          # 2 ay
 START_RANK = 1              # İlk 100
 END_RANK = 100
 TIMEFRAME = '15m'
@@ -44,18 +44,35 @@ def get_sorted_coins():
         return []
 
 def fetch_ohlcv_with_retry(symbol, tf, since, limit, retries=3):
-    """Retry mekanizmalı veri çekme"""
-    for attempt in range(retries):
-        try:
-            data = exchange.fetch_ohlcv(symbol, tf, since=since, limit=limit)
-            return data
-        except Exception as e:
-            if attempt < retries - 1:
-                print(f"   ⚠️ Retry {attempt+1}/{retries}...")
-                time.sleep(2)
-            else:
-                return None
-    return None
+    """Retry mekanizmalı veri çekme - Pagination ile 2 aylık veri"""
+    all_data = []
+    current_since = since
+    
+    # 15m = 60 gün için ~5760 mum lazım, API 1000 limit
+    # 6 iterasyon yapacağız
+    iterations = (limit // 1000) + 1
+    
+    for i in range(iterations):
+        for attempt in range(retries):
+            try:
+                data = exchange.fetch_ohlcv(symbol, tf, since=current_since, limit=1000)
+                if data:
+                    all_data.extend(data)
+                    # Sonraki batch için timestamp güncelle
+                    current_since = data[-1][0] + 1
+                    time.sleep(0.2)
+                break
+            except Exception as e:
+                if attempt < retries - 1:
+                    print(f"   ⚠️ Retry {attempt+1}/{retries}...")
+                    time.sleep(2)
+                else:
+                    return all_data if all_data else None
+        
+        if not data or len(data) < 100:
+            break
+    
+    return all_data if all_data else None
 
 def fetch_and_save_data():
     """15 günlük veriyi çekip CSV'ye kaydet"""
@@ -82,13 +99,12 @@ def fetch_and_save_data():
     
     print(f"✅ {len(coins)} coin bulundu\n")
     
-    # Tarih hesapla
-    end_date = datetime.utcnow()
-    start_date = end_date - timedelta(days=DAYS_TO_FETCH)
+    # Belirli tarih aralığı: 2026-01-12 - 2026-01-21
+    start_date = datetime(2026, 1, 12)
+    end_date = datetime(2026, 1, 21, 23, 59)
     since = int(start_date.timestamp() * 1000)
-    
-    # Her coin için 15 günlük = 15 * 24 * 4 = 1440 mum (15dk için)
-    limit = DAYS_TO_FETCH * 24 * 4
+    # 15dk periyot, 15 gün = 15*24*4 = 1440 mum
+    limit = int((end_date - start_date).total_seconds() // (15*60))
     
     saved_count = 0
     coin_list = []

@@ -1,5 +1,51 @@
 # 📋 CHANGELOG - Crypto Trading Bot
 
+## [v1.1.0] - 2026-02-10
+
+### 🚀 Yeni: Swing Bot (Çift Yönlü)
+
+#### swing_bot.py - BTC Takipli Çift Yönlü Trading
+- **BTC Trend Analizi**: Önce BTC yönü belirleniyor (BULLISH/BEARISH/NEUTRAL)
+- **Çift Yönlü Sinyal**: Hem LONG hem SHORT sinyalleri
+- **Dinamik Kaldıraç**: 5x-10x (sinyal gücüne göre)
+- **Pozisyon Süresi**: 1-4 saat (daha stabil)
+- **Multi-Timeframe**: 15m, 1h, 4h confluence
+
+#### Strateji Parametreleri
+```
+Min Score: 60
+Min Win Rate: 65%
+BTC Aynı Yön Bonus: +20p
+BTC Ters Yön Ceza: -15p
+
+Kaldıraç:
+  • Score≥90 + WR≥75%: 10x
+  • Score≥80 + WR≥70%: 8x
+  • Score≥70 + WR≥65%: 7x
+  • Score≥60: 6x
+
+Stop Loss: ATR × 2.0
+TP1: 1:1.5 (30%)
+TP2: 1:2.5 (30%)
+TP3: 1:4.0 (40%)
+```
+
+#### LONG Sinyal Kriterleri
+- Golden Cross (EMA9 > EMA21)
+- RSI < 30 (aşırı satım)
+- MACD Bullish Cross
+- BB Alt Bant Bounce
+- StochRSI < 20
+
+#### SHORT Sinyal Kriterleri  
+- Death Cross (EMA9 < EMA21)
+- RSI > 80 (aşırı alım)
+- MACD Bearish Cross
+- BB Üst Bant Reddi
+- StochRSI > 85
+
+---
+
 ## [v1.0.0] - 2026-02-09
 
 ### 🚀 Yeni Özellikler
