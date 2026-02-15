@@ -12,7 +12,10 @@ Hedef: Üst banddan SHORT fırsatları
     • Fibonacci onaylı giriş/çıkış noktaları
     • TP1 (Fib 0.5): %50 pozisyon kapat + SL breakeven'e
     • TP2 (Fib 0.618 - Golden Pocket): Kalan %50 kapat
-    • Göstergeler: BB, RSI, MFI, ATR, EMA200
+    • BTC Korelasyonlu Dinamik TP: BTC düşüşünde TP'yi Fib 1.0'a uzaklaştır
+    • BTC Emergency Flip: BTC 15dk'da %1.5+ yeşil mum -> acil kapat
+    • 5 Basamaklı Onay Sistemi (MACD, EMA200, Fib, RSI/MFI, Volume)
+    • Göstergeler: BB, RSI, MFI, ATR, EMA200, MACD
     • Bearish Divergence tespiti
     • Her 10 dakikada tarama
     • API key GEREKLİ!
@@ -115,6 +118,106 @@ class BugraBotApex:
             logging.warning(f"⚠️ BTC ANLIK SIÇRAMA (%{change*100:.2f})! ACİL DURUM KAPATMASI!")
             return True
         return False
+
+    async def check_btc_trend(self):
+        """
+        BTC Trend Teyidi (BTC Trend Confirmation)
+        
+        Her 10 dakikada BTC/USDT'yi 4H ve 1H'da kontrol eder.
+        Eğer BTC hem 4H hem 1H'da EMA 200 altındaysa ve son mum kırmızıysa,
+        piyasa 'Aşırı Ayı' (Extreme Bearish) modundadır.
+        
+        Returns:
+            dict: {
+                'mode': 'extreme_bearish' | 'bearish' | 'bullish' | 'extreme_bullish' | 'neutral',
+                'btc_4h_below_ema200': bool,
+                'btc_1h_below_ema200': bool,
+                'btc_4h_red': bool,
+                'btc_1h_red': bool,
+                'btc_1h_change': float  # Son 1H mumun değişim yüzdesi
+            }
+        """
+        try:
+            # 4H grafiği
+            ohlcv_4h = await self.exchange.fetch_ohlcv('BTC/USDT', timeframe='4h', limit=201)
+            df_4h = pd.DataFrame(ohlcv_4h, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+            df_4h['ema200'] = ta.ema(df_4h['c'], length=200)
+            
+            # 1H grafiği
+            ohlcv_1h = await self.exchange.fetch_ohlcv('BTC/USDT', timeframe='1h', limit=201)
+            df_1h = pd.DataFrame(ohlcv_1h, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+            df_1h['ema200'] = ta.ema(df_1h['c'], length=200)
+            
+            # Son mumlar
+            curr_4h = df_4h.iloc[-1]
+            curr_1h = df_1h.iloc[-1]
+            
+            # Kontroller
+            btc_4h_below_ema200 = curr_4h['c'] < curr_4h['ema200']
+            btc_1h_below_ema200 = curr_1h['c'] < curr_1h['ema200']
+            btc_4h_red = curr_4h['c'] < curr_4h['o']
+            btc_1h_red = curr_1h['c'] < curr_1h['o']
+            btc_1h_change = (curr_1h['c'] - curr_1h['o']) / curr_1h['o']
+            
+            # 4H değişim kontrolü (boğa trendi tespiti için)
+            btc_4h_change = (curr_4h['c'] - df_4h.iloc[-2]['c']) / df_4h.iloc[-2]['c']
+            btc_4h_above_ema200 = curr_4h['c'] > curr_4h['ema200']
+            
+            # Mod Tespiti
+            mode = 'neutral'
+            
+            # Aşırı Ayı: Hem 4H hem 1H EMA200 altında + son mumlar kırmızı
+            if btc_4h_below_ema200 and btc_1h_below_ema200 and btc_4h_red and btc_1h_red:
+                mode = 'extreme_bearish'
+            # Ayı: 1H EMA200 altında veya 4H kırmızı
+            elif btc_1h_below_ema200 or btc_4h_red:
+                mode = 'bearish'
+            # Aşırı Boğa: 4H EMA200 üstü + %2+ yükseliş
+            elif btc_4h_above_ema200 and btc_4h_change >= 0.02:
+                mode = 'extreme_bullish'
+            # Boğa: 4H EMA200 üstü veya 1H yeşil
+            elif btc_4h_above_ema200 or not btc_1h_red:
+                mode = 'bullish'
+            
+            return {
+                'mode': mode,
+                'btc_4h_below_ema200': btc_4h_below_ema200,
+                'btc_1h_below_ema200': btc_1h_below_ema200,
+                'btc_4h_red': btc_4h_red,
+                'btc_1h_red': btc_1h_red,
+                'btc_1h_change': btc_1h_change,
+                'btc_4h_change': btc_4h_change,
+                'btc_price': curr_1h['c']
+            }
+            
+        except Exception as e:
+            logging.warning(f"⚠️ BTC trend kontrolü başarısız: {str(e)[:50]}")
+            return {'mode': 'neutral', 'btc_1h_change': 0}
+
+    async def check_btc_emergency_flip(self):
+        """
+        BTC Acil Durum Kontrolü (Emergency Flip)
+        
+        SHORT pozisyon varken BTC 15 dakikalık grafikte sert bir boğa mumu (%1.5+) 
+        yakarsa, altcoinlerin kârda olup olmadığına bakmaksızın pozisyonu piyasa 
+        fiyatından kapat.
+        
+        Returns:
+            bool: Emergency flip tetiklendi mi?
+        """
+        try:
+            ohlcv = await self.exchange.fetch_ohlcv('BTC/USDT', timeframe='15m', limit=2)
+            curr = ohlcv[-1]
+            change = (curr[4] - curr[1]) / curr[1]  # close - open
+            
+            if change >= 0.015:  # %1.5+ yeşil mum
+                logging.warning(f"🚨 BTC ACİL DURUM FLIP! 15m'de %{change*100:.1f} yeşil mum!")
+                return True
+            return False
+            
+        except Exception as e:
+            logging.warning(f"⚠️ BTC Emergency Flip kontrolü başarısız: {str(e)[:50]}")
+            return False
 
     async def get_indicators(self, symbol):
         ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=self.timeframe, limit=100)
@@ -377,13 +480,16 @@ class BugraBotApex:
                 'sl': sl_price,
                 'tp1': tp1_price,
                 'tp2': tp2_price,
+                'original_tp2': tp2_price,  # Orijinal TP2 (Fib 0.618) - BTC dinamik TP için
                 'signal': signal,
                 'time': datetime.now(),
                 'fib_levels': fib_levels,
                 'quantity': 1.0,  # Başlangıç pozisyon boyutu (simülasyon)
                 'tp1_hit': False,  # TP1'e ulaşıldı mı?
                 'tp2_hit': False,  # TP2'ye ulaşıldı mı?
-                'sl_moved_to_breakeven': False  # SL breakeven'e çekildi mi?
+                'sl_moved_to_breakeven': False,  # SL breakeven'e çekildi mi?
+                'dynamic_tp_active': False,  # BTC bazlı dinamik TP aktif mi?
+                'last_btc_mode': 'neutral'  # Son BTC trend modu
             }
             
         except Exception as e:
@@ -394,13 +500,70 @@ class BugraBotApex:
         Aktif pozisyonları izle, TP1/TP2'ye ulaşanları kademeli kapat.
         TP1: %50 kapat + SL breakeven
         TP2: Kalan %50'yi kapat
+        
+        BTC Korelasyonlu Dinamik TP:
+        - BTC 'Aşırı Ayı' modundaysa SHORT TP'yi Fib 1.0'a uzaklaştır
+        - BTC yukarı dönerse TP'yi Fib 0.618'e geri çek
         """
         if not self.active_trades:
+            return
+        
+        # BTC Trend Kontrolü (10 dakikada bir)
+        btc_trend = await self.check_btc_trend()
+        btc_mode = btc_trend['mode']
+        
+        # BTC Emergency Flip Kontrolü (SHORT pozisyonlar için)
+        emergency_flip = await self.check_btc_emergency_flip()
+        
+        if emergency_flip and self.active_trades:
+            logging.warning("🚨 BTC ACI DURUM FLIP - TÜM SHORT POZİSYONLAR KAPATILIYOR!")
+            for symbol in list(self.active_trades.keys()):
+                trade = self.active_trades[symbol]
+                
+                try:
+                    ticker = await self.exchange.fetch_ticker(symbol)
+                    current_price = ticker['last']
+                    profit_pct = ((trade['entry'] - current_price) / trade['entry']) * 100
+                    
+                    logging.warning(f"   ❌ {symbol} ACİL KAPATMA (Piyasa: ${current_price:.6f}, Kar: %{profit_pct:.2f})")
+                    del self.active_trades[symbol]
+                    self.cooldowns[symbol] = time.time()
+                    
+                except Exception as e:
+                    logging.error(f"⚠️ {symbol} acil kapatma hatası: {str(e)[:50]}")
+            
             return
         
         for symbol in list(self.active_trades.keys()):
             try:
                 trade = self.active_trades[symbol]
+                
+                # BTC Bazlı Dinamik TP Güncelleme (Sadece TP1 sonrası, TP2 öncesi)
+                if trade['tp1_hit'] and not trade['tp2_hit']:
+                    # Aşırı Ayı Modu: TP2'yi Fib 1.0'a uzaklaştır
+                    if btc_mode == 'extreme_bearish' and not trade['dynamic_tp_active']:
+                        old_tp2 = trade['tp2']
+                        new_tp2 = trade['fib_levels']['fib_1']  # Fibonacci 1.0 (Tam Dip)
+                        trade['tp2'] = new_tp2
+                        trade['dynamic_tp_active'] = True
+                        trade['last_btc_mode'] = btc_mode
+                        
+                        logging.info(f"📉 {symbol}: BTC düşüşü teyit edildi!")
+                        logging.info(f"   TP2 güncellendi: ${old_tp2:.6f} → ${new_tp2:.6f} (Fib 1.0)")
+                        logging.info(f"   💰 Kâr potansiyeli arttı!")
+                    
+                    # BTC Yukarı Döndü: TP2'yi güvenli seviyeye geri çek
+                    elif btc_mode in ['bullish', 'extreme_bullish'] and trade['dynamic_tp_active']:
+                        old_tp2 = trade['tp2']
+                        # Güvenli çıkış: Orijinal Fib 0.618 veya BB Orta Bandı
+                        new_tp2 = trade['original_tp2']  # Fib 0.618
+                        trade['tp2'] = new_tp2
+                        trade['dynamic_tp_active'] = False
+                        trade['last_btc_mode'] = btc_mode
+                        
+                        logging.warning(f"📈 {symbol}: BTC yukarı döndü!")
+                        logging.warning(f"   ⚠️ TP2 güvenli seviyeye çekildi: ${old_tp2:.6f} → ${new_tp2:.6f}")
+                        logging.warning(f"   🛡️ Kar koruma modu aktif")
                 
                 # Güncel fiyatı al
                 ticker = await self.exchange.fetch_ticker(symbol)
@@ -420,9 +583,11 @@ class BugraBotApex:
                     
                     logging.info(f"   ✅ {symbol} pozisyonu güncellendi - Kalan: %50")
                 
-                # TP2 Kontrolü (Fib 0.618)
+                # TP2 Kontrolü (Fib 0.618 veya Dinamik TP)
                 elif trade['tp1_hit'] and not trade['tp2_hit'] and current_price <= trade['tp2']:
-                    logging.info(f"🎯🎯 {symbol} TP2'YE ULAŞTI! (${current_price:.6f} <= ${trade['tp2']:.6f})")
+                    tp_type = "Dinamik (Fib 1.0)" if trade['dynamic_tp_active'] else "Fib 0.618"
+                    logging.info(f"🎯🎯 {symbol} TP2'YE ULAŞTI! ({tp_type})")
+                    logging.info(f"   → Fiyat: ${current_price:.6f} <= ${trade['tp2']:.6f}")
                     logging.info(f"   → Kalan %50 pozisyon kapatılıyor...")
                     
                     # Pozisyon flag'ini güncelle
@@ -431,6 +596,9 @@ class BugraBotApex:
                     # Kar hesapla
                     profit_pct = ((trade['entry'] - current_price) / trade['entry']) * 100
                     logging.info(f"   ✅ Toplam Kar: %{profit_pct:.2f}")
+                    
+                    if trade['dynamic_tp_active']:
+                        logging.info(f"   🚀 BTC korelasyonlu dinamik TP sayesinde daha fazla kar!")
                     
                     # Pozisyonu kapat
                     del self.active_trades[symbol]
@@ -475,6 +643,8 @@ class BugraBotApex:
         logging.info("📌 Hedef: Üst banddan SHORT fırsatları")
         logging.info("📌 Filtre: Top 150 hacim (ilk 40 gainer hariç)")
         logging.info("📌 Koruma: BTC Shield aktif (15m %2+ -> kapat)")
+        logging.info("📌 Yeni: BTC Emergency Flip (15m %1.5+ -> acil kapat)")
+        logging.info("📌 Yeni: BTC Dinamik TP (BTC düşüşünde TP1.0'a uzaklaştır)")
         logging.info("📌 Max Pozisyon: 4 eş zamanlı")
         logging.info("="*70)
         logging.info("")
@@ -585,8 +755,10 @@ if __name__ == "__main__":
         print("📌 Hedef: Üst banddan SHORT fırsatları")
         print("📌 TP1 (Fib 0.5): %50 pozisyon kapat + SL breakeven'e")
         print("📌 TP2 (Fib 0.618): Kalan %50 Golden Pocket'ta kapat")
+        print("📌 🆕 BTC Dinamik TP: BTC düşüşünde TP'yi Fib 1.0'a uzaklaştır")
+        print("📌 🆕 BTC Emergency Flip: 15dk'da %1.5+ yeşil mum -> acil kapat")
         print("📌 Filtre: Top 150 hacim (ilk 40 gainer hariç)")
-        print("📌 BTC Shield aktif")
+        print("📌 BTC Shield aktif (15m %2+ -> kapat)")
         print("📌 Her 10 dakikada tarama")
         print("="*70)
         print("")
