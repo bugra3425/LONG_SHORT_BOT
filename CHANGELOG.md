@@ -7,6 +7,126 @@ Versiyon: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.1.0] - 2026-02-15
+
+### 🎯 Uzun Vadeli Bot - Basamaklı Onay Sistemi
+
+**Strateji İyileştirmesi:** 5 aşamalı doğrulama sistemi ile daha güvenilir sinyaller
+
+---
+
+### ✅ Added (Eklenenler)
+
+#### 🔥 Basamaklı Onay Sistemi (5-Stage Confirmation)
+**Her basamak geçilmeden bir sonrakine gidilmez. Reddedilme nedenleri detaylı loglanır.**
+
+**Basamak 1: MACD Trend Yorgunluğu**
+- MACD Histogram küçülüyor mu veya negatif bölgede mi?
+- Trend yorgunluğu tespiti (momentum kaybı)
+- Parametreler: MACD(12, 26, 9)
+
+**Basamak 2: Lokasyon ve Trend Onayı**
+- Fiyat EMA 200 üzerinde mi?
+- Fiyat Bollinger üst bandına dokunuyor mu?
+- Yükseliş trendinde tepe kontrolü
+
+**Basamak 3: Matematiksel Zirve ve Fibonacci**
+- Fiyat Fibonacci kritik seviyelerinde mi? (0, 1.272, 1.618)
+- Tolerans: %0.5
+- Kapanış Fib 0.236 altında mı? (trend kırılımı)
+
+**Basamak 4: Momentum ve Uyumsuzluk**
+- RSI > 60 (aşırı alım)
+- MFI > 75 (para akışı aşırı alım)
+- Bearish Divergence var mı? (fiyat yükselir, RSI düşer)
+
+**Basamak 5: Tetikleyici ve Hacim Patlaması**
+- Son mum kırmızı mı?
+- Gövde %3'ten büyük mü?
+- Hacim son 5 mumun ortalamasından 1.5 kat fazla mı?
+
+#### 📊 MACD İndikatörü Eklendi
+- Trend yorgunluğu tespiti için yeni indikatör
+- Histogram analizi: küçülme veya negatif bölge kontrolü
+- Parametreler: Fast=12, Slow=26, Signal=9
+
+#### 🎯 Kademeli TP/SL Yönetimi (Position Monitoring)
+**Gerçek zamanlı pozisyon izleme sistemi:**
+- TP1 (Fib 0.5) tetiklenince:
+  - Otomatik %50 pozisyon kapat
+  - Stop Loss'u breakeven'e çek (risk sıfırlanır)
+  - Kalan %50'yi izlemeye devam et
+- TP2 (Fib 0.618) tetiklenince:
+  - Kalan %50'yi kapat
+  - Toplam kar hesapla ve logla
+- SL tetiklenince:
+  - Eğer breakeven SL ise: Zararsız çıkış
+  - Eğer initial SL ise: Zarar hesapla ve logla
+
+#### 📝 Detaylı Rejection Logging
+**Her basamakta reddedilme nedeni açıkça loglanıyor:**
+```
+❌ Basamak 1: MACD histogram yorulmamış (hist: 0.0234)
+❌ Basamak 2: Fiyat EMA200 altında (fiyat: 1.23, EMA200: 1.45)
+❌ Basamak 3: Fib 0.236 kırılmadı (kapanış: 1.45, Fib 0.236: 1.42)
+❌ Basamak 4: RSI yeterli değil (RSI: 45.2)
+❌ Basamak 5: Hacim patlaması yok (hacim: 1500, ort: 1200)
+```
+
+**Sinyal bulunduğunda tüm kriterlerin onay mesajı:**
+```
+✅ BASAMAKLI ONAY SİSTEMİ: Tüm kriterler OK!
+   Basamak 1: MACD histogram düşüyor ✓
+   Basamak 2: Fiyat EMA200 üstünde + BB üst bandda ✓
+   Basamak 3: Fibonacci kritik seviyede + 0.236 kırıldı ✓
+   Basamak 4: RSI=72.3 MFI=81.5 + Divergence ✓
+   Basamak 5: Kırmızı mum + Gövde %4.2 + Hacim 1.5x ✓
+```
+
+---
+
+### 🔧 Changed (Değişenler)
+
+#### check_signal() Fonksiyonu Yeniden Yapılandırıldı
+- Önceki sistem: Tüm kontroller tek seferde
+- Yeni sistem: 5 basamaklı ardışık kontrol
+- Her basamak detaylı log üretiyor
+- Daha kolay debug ve optimizasyon
+
+#### Hacim Spike Eşiği Güçlendirildi
+- Önceki: 1.2x ortalama hacim
+- Yeni: 1.5x ortalama hacim
+- Sebep: Daha güçlü tetikleyici sinyaller
+
+#### Pozisyon Dictionary Güncellendi
+- Yeni alanlar: `quantity`, `tp2_hit`
+- Kademeli kapatma için state tracking
+- Breakeven SL takibi
+
+---
+
+### 🐛 Fixed (Düzeltmeler)
+
+- `time` modülü import eksikliği giderildi
+- `active_trades` dictionary'sine eksik key'ler eklendi
+- `tp2_hit` flag'i TP2 kontrolünde güncelleniyor
+
+---
+
+### 📈 Performance (Performans)
+
+**Sinyal Kalitesi Artırıldı:**
+- 5 basamaklı onay sistemi sayesinde false positive'ler azaldı
+- MACD ile trend yorgunluğu erken tespit ediliyor
+- Detaylı logging ile stratejinin neden çalıştığı/çalışmadığı anlaşılıyor
+
+**Risk Yönetimi Güçlendirildi:**
+- TP1'den sonra SL breakeven'e çekiliyor (risk-free trade)
+- Kademeli kar alma ile piyasa gürültüsünden etkilenme azaldı
+- BTC Shield ile short pozisyonlar korunuyor
+
+---
+
 ## [2.0.0] - 2026-02-15
 
 ### 🎉 Major Release - Modüler Yapı

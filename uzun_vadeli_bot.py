@@ -26,6 +26,7 @@ import pandas as pd
 import pandas_ta as ta
 import logging
 import sys
+import time
 from datetime import datetime
 
 # --- LOG AYARLARI ---
@@ -128,6 +129,12 @@ class BugraBotApex:
         df['atr'] = ta.atr(df['h'], df['l'], df['c'], length=14)
         df['ema200'] = ta.ema(df['c'], length=200)
         
+        # MACD (12, 26, 9) - Trend yorgunluğu tespiti için
+        macd = ta.macd(df['c'], fast=12, slow=26, signal=9)
+        df['macd'] = macd['MACD_12_26_9']
+        df['macd_signal'] = macd['MACDs_12_26_9']
+        df['macd_hist'] = macd['MACDh_12_26_9']
+        
         return df
     
     def calculate_fibonacci_levels(self, df, lookback=75):
@@ -170,29 +177,49 @@ class BugraBotApex:
 
     def check_signal(self, df, fib_levels):
         """
-        Sinyal kontrolü - Fibonacci onaylı.
-        SHORT sinyali için Fibonacci 0/1.272/1.618 seviyelerinde olmalı
-        ve 0.236 altında kapanış yapmalı.
+        BASAMAKLI ONAY SİSTEMİ (Step-by-Step Confirmation)
+        Her basamak geçilmeden bir sonrakine gidilmez.
+        Reddedilme nedeni loglanır.
         """
         curr = df.iloc[-1]
         prev = df.iloc[-2]
         
-        # 1. Lokasyon Kilidi: Fiyat Üst Bandın Tepesinde ve EMA200 Üstünde olmalı
-        if curr['c'] < curr['bb_upper'] or curr['c'] < curr['ema200']:
-            return None
-
-        # 2. RSI/MFI Aşırı Alım Filtresi
-        if curr['rsi'] < 60 or curr['mfi'] < 75:
-            return None
-
-        # 3. Ayı Uyumsuzluğu
-        if not self.check_divergence(df):
+        # ========================================
+        # BASAMAK 1: PİYASA ve HACİM FİLTRESİ (The Environment)
+        # ========================================
+        # İlk 150 hacimli coin, ilk 40 gainer ele - fetch_eligible_symbols() yapıyor
+        
+        # MACD Trend Yorgunluğu Kontrolü
+        # MACD Histogram küçülüyor mu veya negatif mi?
+        macd_hist_curr = curr['macd_hist']
+        macd_hist_prev = df.iloc[-2]['macd_hist']
+        macd_hist_declining = macd_hist_curr < macd_hist_prev  # Küçülüyor
+        macd_hist_negative = macd_hist_curr < 0  # Negatif bölgede
+        
+        if not (macd_hist_declining or macd_hist_negative):
+            logging.info(f"❌ Basamak 1: MACD histogram yorulmamış (hist: {macd_hist_curr:.4f})")
             return None
         
-        # 4. FİBONACCI ONAYI (KRİTİK!)
-        # Fiyat Fibonacci 0, 1.272 veya 1.618 seviyelerine çok yakın mı? (%0.5 tolerans)
+        # ========================================
+        # BASAMAK 2: LOKASYON ve TREND ONAYI (The Territory)
+        # ========================================
+        # 1. Fiyat EMA 200 üzerinde mi?
+        if curr['c'] < curr['ema200']:
+            logging.info(f"❌ Basamak 2: Fiyat EMA200 altında (fiyat: {curr['c']:.2f}, EMA200: {curr['ema200']:.2f})")
+            return None
+        
+        # 2. Fiyat Bollinger Üst Bandına dokunuyor mu?
+        if curr['c'] < curr['bb_upper']:
+            logging.info(f"❌ Basamak 2: Fiyat BB üst banda dokunmuyor (fiyat: {curr['c']:.2f}, BB üst: {curr['bb_upper']:.2f})")
+            return None
+        
+        # ========================================
+        # BASAMAK 3: MATEMATİKSEL ZİRVE ve FİBONACCI (The Harmonic Gate)
+        # ========================================
+        # Fibonacci seviyelerini kontrol et
         tolerance = 0.005  # %0.5
         
+        # Fiyat Fibonacci 0, 1.272 veya 1.618 seviyelerine yakın mı?
         near_fib_0 = abs(curr['h'] - fib_levels['fib_0']) / fib_levels['fib_0'] < tolerance
         near_ext_1272 = abs(curr['h'] - fib_levels['ext_1272']) / fib_levels['ext_1272'] < tolerance
         near_ext_1618 = abs(curr['h'] - fib_levels['ext_1618']) / fib_levels['ext_1618'] < tolerance
@@ -200,20 +227,68 @@ class BugraBotApex:
         at_fibonacci_key_level = near_fib_0 or near_ext_1272 or near_ext_1618
         
         if not at_fibonacci_key_level:
-            return None  # Fibonacci seviyesinde değilse işlem yok
+            logging.info(f"❌ Basamak 3: Fiyat Fibonacci kritik seviyelerinde değil")
+            return None
         
-        # 5. Kırmızı mum Fibonacci 0.236 ALTINDA kapanmalı (düzeltme başladı kanıtı)
+        # Trend Kırılımı: Kapanış Fib 0.236 ALTINDA mı?
         closed_below_fib236 = curr['c'] < fib_levels['fib_236']
         
         if not closed_below_fib236:
-            return None  # 0.236 altına kapanmadıysa henüz erken
-
-        # 6. Tetikleyici Mum (Hacimli Kırmızı Mum veya 2 Ardışık Kırmızı)
+            logging.info(f"❌ Basamak 3: Fib 0.236 kırılmadı (kapanış: {curr['c']:.2f}, Fib 0.236: {fib_levels['fib_236']:.2f})")
+            return None
+        
+        # ========================================
+        # BASAMAK 4: MOMENTUM ve UYUMSUZLUK (The Exhaustion)
+        # ========================================
+        # 1. RSI > 60 ve MFI > 75 mi?
+        if curr['rsi'] < 60:
+            logging.info(f"❌ Basamak 4: RSI yeterli değil (RSI: {curr['rsi']:.1f})")
+            return None
+        
+        if curr['mfi'] < 75:
+            logging.info(f"❌ Basamak 4: MFI yeterli değil (MFI: {curr['mfi']:.1f})")
+            return None
+        
+        # 2. Bearish Divergence var mı?
+        if not self.check_divergence(df):
+            logging.info(f"❌ Basamak 4: Bearish Divergence tespit edilemedi")
+            return None
+        
+        # ========================================
+        # BASAMAK 5: TETİKLEYİCİ ve HACİM PATLAMASI (The Trigger)
+        # ========================================
+        # Son mum KIRMIZI mı?
         is_red = curr['c'] < curr['o']
+        if not is_red:
+            logging.info(f"❌ Basamak 5: Son mum kırmızı değil (yeşil mum)")
+            return None
+        
+        # Gövde %3'ten büyük mü?
         body_pct = abs(curr['c'] - curr['o']) / curr['o']
-        vol_spike = curr['v'] > (df['v'].iloc[-6:-1].mean() * 1.2)
-
-        if is_red and body_pct >= 0.03 and vol_spike:
+        if body_pct < 0.03:
+            logging.info(f"❌ Basamak 5: Gövde yeterli büyük değil (gövde: %{body_pct*100:.2f})")
+            return None
+        
+        # Hacim son 5 mumun ortalamasından 1.5 kat fazla mı?
+        avg_volume = df['v'].iloc[-6:-1].mean()
+        vol_spike = curr['v'] > (avg_volume * 1.5)
+        
+        if not vol_spike:
+            logging.info(f"❌ Basamak 5: Hacim patlaması yok (hacim: {curr['v']:.0f}, ort: {avg_volume:.0f})")
+            return None
+        
+        # ========================================
+        # ✅ TÜM BASAMAKLAR BAŞARIYLA GEÇİLDİ!
+        # ========================================
+        logging.info("✅ BASAMAKLI ONAY SİSTEMİ: Tüm kriterler OK!")
+        logging.info(f"   Basamak 1: MACD histogram {'negatif' if macd_hist_negative else 'düşüyor'} ✓")
+        logging.info(f"   Basamak 2: Fiyat EMA200 üstünde + BB üst bandda ✓")
+        logging.info(f"   Basamak 3: Fibonacci kritik seviyede + 0.236 kırıldı ✓")
+        logging.info(f"   Basamak 4: RSI={curr['rsi']:.1f} MFI={curr['mfi']:.1f} + Divergence ✓")
+        logging.info(f"   Basamak 5: Kırmızı mum + Gövde %{body_pct*100:.1f} + Hacim 1.5x ✓")
+        
+        # İki farklı sinyal tipi: Ani düşüş veya 2 mum onayı
+        if body_pct >= 0.03 and vol_spike:
             return "SHORT_IMMEDIATE"
         elif is_red and df.iloc[-2]['c'] < df.iloc[-2]['o']:
             return "SHORT_CONFIRMED_2_CANDLES"
@@ -305,12 +380,79 @@ class BugraBotApex:
                 'signal': signal,
                 'time': datetime.now(),
                 'fib_levels': fib_levels,
+                'quantity': 1.0,  # Başlangıç pozisyon boyutu (simülasyon)
                 'tp1_hit': False,  # TP1'e ulaşıldı mı?
+                'tp2_hit': False,  # TP2'ye ulaşıldı mı?
                 'sl_moved_to_breakeven': False  # SL breakeven'e çekildi mi?
             }
             
         except Exception as e:
             logging.error(f"❌ {symbol} pozisyon açma hatası: {e}")
+
+    async def monitor_active_positions(self):
+        """
+        Aktif pozisyonları izle, TP1/TP2'ye ulaşanları kademeli kapat.
+        TP1: %50 kapat + SL breakeven
+        TP2: Kalan %50'yi kapat
+        """
+        if not self.active_trades:
+            return
+        
+        for symbol in list(self.active_trades.keys()):
+            try:
+                trade = self.active_trades[symbol]
+                
+                # Güncel fiyatı al
+                ticker = await self.exchange.fetch_ticker(symbol)
+                current_price = ticker['last']
+                
+                # TP1 Kontrolü (Fib 0.5)
+                if not trade['tp1_hit'] and current_price <= trade['tp1']:
+                    logging.info(f"🎯 {symbol} TP1'E ULAŞTI! (${current_price:.6f} <= ${trade['tp1']:.6f})")
+                    logging.info(f"   → %50 pozisyon kapatılıyor...")
+                    logging.info(f"   → SL breakeven'e çekiliyor (${trade['entry']:.6f})")
+                    
+                    # Pozisyonu güncelle
+                    trade['tp1_hit'] = True
+                    trade['sl'] = trade['entry']  # SL breakeven
+                    trade['sl_moved_to_breakeven'] = True
+                    trade['quantity'] = trade['quantity'] * 0.5  # Kalan %50
+                    
+                    logging.info(f"   ✅ {symbol} pozisyonu güncellendi - Kalan: %50")
+                
+                # TP2 Kontrolü (Fib 0.618)
+                elif trade['tp1_hit'] and not trade['tp2_hit'] and current_price <= trade['tp2']:
+                    logging.info(f"🎯🎯 {symbol} TP2'YE ULAŞTI! (${current_price:.6f} <= ${trade['tp2']:.6f})")
+                    logging.info(f"   → Kalan %50 pozisyon kapatılıyor...")
+                    
+                    # Pozisyon flag'ini güncelle
+                    trade['tp2_hit'] = True
+                    
+                    # Kar hesapla
+                    profit_pct = ((trade['entry'] - current_price) / trade['entry']) * 100
+                    logging.info(f"   ✅ Toplam Kar: %{profit_pct:.2f}")
+                    
+                    # Pozisyonu kapat
+                    del self.active_trades[symbol]
+                    self.cooldowns[symbol] = time.time()
+                    
+                    logging.info(f"   🏁 {symbol} pozisyonu tamamen kapatıldı!")
+                
+                # SL Kontrolü (TP1'den önce veya sonra)
+                elif current_price >= trade['sl']:
+                    if trade['sl_moved_to_breakeven']:
+                        logging.info(f"🔄 {symbol} Breakeven SL tetiklendi (${current_price:.6f} >= ${trade['sl']:.6f})")
+                        logging.info(f"   → Zarar yok, %50 kar realize edildi")
+                    else:
+                        loss_pct = ((current_price - trade['entry']) / trade['entry']) * 100
+                        logging.warning(f"🛑 {symbol} SL tetiklendi! (${current_price:.6f} >= ${trade['sl']:.6f})")
+                        logging.warning(f"   → Zarar: %{loss_pct:.2f}")
+                    
+                    del self.active_trades[symbol]
+                    self.cooldowns[symbol] = time.time()
+                    
+            except Exception as e:
+                logging.error(f"⚠️ {symbol} pozisyon izleme hatası: {str(e)[:50]}")
 
     async def close_all_shorts(self):
         """BTC Shield tetiklendiğinde tüm short pozisyonları kapat"""
@@ -369,6 +511,9 @@ class BugraBotApex:
 
                 if self.btc_panic:
                     continue  # Hala panic modundaysa tarama yapma
+
+                # Aktif pozisyonları izle (TP1/TP2 kontrolü)
+                await self.monitor_active_positions()
 
                 try:
                     symbols = await self.fetch_eligible_symbols()
