@@ -7,6 +7,68 @@ Versiyon: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.2.0] - 2026-02-15
+
+### 📊 Backtest Sistemi - Pozisyon Yönetimi ve Risk Kontrolü
+
+**Backtest İyileştirmesi:** Profesyonel risk yönetimi ve sermaye tahsisi kuralları
+
+---
+
+### ✅ Added (Eklenenler)
+
+#### 💰 Pozisyon Yönetimi Sistemi
+**Sermaye ve risk yönetimi kuralları backtest'e entegre edildi:**
+
+- **Minimum İşlem Sayısı:** En az 3 işlem açılmalı (strateji güvenilirliği için)
+- **Maksimum İşlem Sayısı:** En fazla 8 işlem açılabilir (aşırı pozisyon riski önleme)
+- **Maksimum Eşzamanlı Pozisyon:** Aynı anda en fazla 4 açık pozisyon
+- **Sermaye Bölümü:** Her işlem için sermayenin 1/4'ü kullanılır ($10,000 sermaye → $2,500/işlem)
+
+#### 📈 Geliştirilmiş Raporlama
+**USD bazlı kar/zarar ve ROI hesaplaması:**
+
+- **Profit USD:** Her işlem için dolar bazlı kar/zarar
+- **Total Profit USD:** Toplam net kar/zarar ($)
+- **ROI (Return on Investment):** Yatırım getirisi yüzdesi
+- **Final Capital:** Backtest sonu sermaye durumu
+- **Position Size Tracking:** Her işlemin pozisyon büyüklüğü takibi
+
+#### 📋 JSON Rapor Genişletildi
+**Backtest sonuçları daha detaylı kaydediliyor:**
+
+```json
+{
+  "backtest_config": {
+    "initial_capital": 10000,
+    "position_size_divider": 4,
+    "max_active_trades": 4,
+    "min_total_trades": 3,
+    "max_total_trades": 8
+  },
+  "summary": {
+    "total_profit_usd": 450.25,
+    "final_capital": 10450.25,
+    "roi": 4.50
+  },
+  "trades": [
+    {
+      "position_size_usdt": 2500,
+      "profit_usd": 75.50
+    }
+  ]
+}
+```
+
+### 🔧 Changed (Değişenler)
+
+- **Backtest Mantığı:** 3x-8x işlem aralığı zorunlu
+- **Pozisyon Limiti:** Aynı anda max 4 pozisyon kontrolü eklendi
+- **Kar Hesaplama:** Yüzdesel + USD bazlı çift raporlama
+- **Log Formatı:** Her işlemde pozisyon boyutu ve USD kar gösterimi
+
+---
+
 ## [2.1.0] - 2026-02-15
 
 ### 🎯 Uzun Vadeli Bot - Basamaklı Onay Sistemi
