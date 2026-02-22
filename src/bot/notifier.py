@@ -3,10 +3,14 @@
 """
 import asyncio
 import logging
+import os
 import httpx
-from .config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 logger = logging.getLogger("notifier")
+
+# .env'den direkt oku (18.02.2026.py ile uyumlu)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 _BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 

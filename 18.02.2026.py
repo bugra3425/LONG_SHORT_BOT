@@ -40,6 +40,12 @@ except ImportError:
 import aiohttp
 import ccxt.async_support as ccxt
 
+# ── Telegram Notifier ────────────────────────────────────────────────
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+from src.bot import notifier
+
 # ── Logging Ayarları ─────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -723,6 +729,19 @@ class PumpSnifferBot:
             f"     Boyut : {pos['position_size_usdt']:.4f} USDT  "
             f"(x{pos['leverage']} → {pos['notional_usdt']:.4f} notional)"
         )
+        
+        # 📲 Telegram bildirim
+        try:
+            notifier.notify_trade_open(
+                symbol=symbol,
+                side="SHORT",
+                amount=pos["qty"],
+                price=entry_price,
+                margin=pos["position_size_usdt"]
+            )
+        except Exception as e:
+            log.debug(f"📵 Telegram bildirim hatası (görmezden gelindi): {e}")
+        
         return trade
 
     async def manage_open_trades(self, equity: float):
@@ -755,6 +774,11 @@ class PumpSnifferBot:
                         trade.sl_moved_to_be = True
                         log.info(f"  ⚡ BREAKEVEN: {sym}  Düşüş: %{price_drop_pct:.1f}  "
                                  f"SL → {trade.entry_price:.6f}")
+                        # 📲 BE bildirimi
+                        try:
+                            notifier.send(f"⚡ <b>BREAKEVEN</b>\n🪙 {sym}\n📉 Düşüş: {price_drop_pct:.1f}%\n🛡️ SL → Giriş fiyatı")
+                        except Exception:
+                            pass
 
                 # ── Stage 2: TSL — %8 düşüşte aktif, SL = lowest_low × 1.03 ──
                 bar_drop_pct = (trade.entry_price - curr["low"]) / trade.entry_price * 100.0
@@ -766,6 +790,11 @@ class PumpSnifferBot:
                         trade.stop_loss = min(trade.stop_loss, new_sl)
                         log.info(f"  🎯 TSL AKTİF: {sym}  Düşüş: %{bar_drop_pct:.1f}  "
                                  f"Low: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
+                        # 📲 TSL aktivasyon bildirimi
+                        try:
+                            notifier.send(f"🎯 <b>TSL AKTİF</b>\n🪙 {sym}\n📉 Düşüş: {bar_drop_pct:.1f}%\n🛡️ Trailing stop başlatıldı")
+                        except Exception:
+                            pass
                 else:
                     if curr["low"] < trade.lowest_low_reached:
                         trade.lowest_low_reached = curr["low"]
@@ -791,6 +820,11 @@ class PumpSnifferBot:
                     self._post_exit_price[sym] = exit_p
                     self._new_push[sym] = False
                     log.info(f"  🔴 {reason}: {sym}  |  PnL: {trade.pnl_usdt:+.2f} USDT")
+                    # 📲 SL/TSL çıkış bildirimi
+                    try:
+                        notifier.notify_trade_close(sym, reason, trade.pnl_pct, trade.pnl_usdt)
+                    except Exception:
+                        pass
                     continue
 
                 # ── Stage 4: Zararda yeşil mum → SHORT kapat ───────────────────
@@ -811,6 +845,11 @@ class PumpSnifferBot:
                         self._post_exit_price[sym] = exit_p
                         self._new_push[sym] = False
                         log.info(f"  🟠 GREEN-10: {sym}  Gövde: %{green_body_pct:.1f}  Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT")
+                        # 📲 GREEN-10 çıkış bildirimi
+                        try:
+                            notifier.notify_trade_close(sym, "GREEN-10", trade.pnl_pct, trade.pnl_usdt)
+                        except Exception:
+                            pass
                         continue
                     # Küçük zararda yeşil → sayacı artır, 2'de kapat
                     trade.consec_green_loss += 1
@@ -828,6 +867,11 @@ class PumpSnifferBot:
                         self._post_exit_price[sym] = exit_p
                         self._new_push[sym] = False
                         log.info(f"  🟠 2xGREEN-LOSS: {sym}  Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT")
+                        # 📲 2xGREEN-LOSS çıkış bildirimi
+                        try:
+                            notifier.notify_trade_close(sym, "2xGREEN-LOSS", trade.pnl_pct, trade.pnl_usdt)
+                        except Exception:
+                            pass
                         continue
                 else:
                     trade.consec_green_loss = 0  # Kırmızı veya kârda yeşil → sayacı sıfırla
