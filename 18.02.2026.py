@@ -40,11 +40,23 @@ except ImportError:
 import aiohttp
 import ccxt.async_support as ccxt
 
-# ── Telegram Notifier ────────────────────────────────────────────────
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent))
-from src.bot import notifier
+# ── Telegram Notifier (Opsiyonel) ───────────────────────────────────
+try:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    from src.bot import notifier
+    NOTIFIER_AVAILABLE = True
+except ImportError:
+    NOTIFIER_AVAILABLE = False
+    class notifier:
+        """Dummy notifier - httpx yoksa hiçbir şey yapmaz"""
+        @staticmethod
+        def send(text): pass
+        @staticmethod
+        def notify_trade_open(*args, **kwargs): pass
+        @staticmethod
+        def notify_trade_close(*args, **kwargs): pass
 
 # ── Logging Ayarları ─────────────────────────────────────────────────────
 logging.basicConfig(
