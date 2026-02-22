@@ -2067,6 +2067,32 @@ async def main_live():
 
 
 def main():
+    # ══════════════════════════════════════════════════════════════════════════
+    # Container/Northflank için otomatik canlı mod (interaktif menü atlama)
+    # ══════════════════════════════════════════════════════════════════════════
+    import os
+    auto_live = os.getenv("AUTO_LIVE", "false").lower() == "true"
+    
+    if auto_live:
+        mod = "DEMO 🧪" if Config.DEMO_MODE else "CANLI ⚠️"
+        print()
+        print("=" * 56)
+        print("   PUMP & DUMP REVERSION BOT — Binance Futures")
+        print("=" * 56)
+        print()
+        print(f"  🚀 AUTO_LIVE MODE: {mod}")
+        if not Config.DEMO_MODE:
+            print("  ⚠️  GERÇEK PARA İLE İŞLEM AÇILACAK!")
+        print()
+        print("=" * 56)
+        print()
+        log.info("Container ortamı tespit edildi, otomatik canlı moda geçiliyor...")
+        asyncio.run(main_live())
+        return
+    
+    # ══════════════════════════════════════════════════════════════════════════
+    # Normal interaktif menü (local development)
+    # ══════════════════════════════════════════════════════════════════════════
     print()
     print("=" * 56)
     print("   PUMP & DUMP REVERSION BOT — Binance Futures")

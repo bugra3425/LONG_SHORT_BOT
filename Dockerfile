@@ -54,6 +54,9 @@ COPY config_example.py .
 # Create logs directory
 RUN mkdir -p /app/logs && chmod 755 /app/logs
 
+# Container ortamı için otomatik canlı mod
+ENV AUTO_LIVE=true
+
 # Health check
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
     CMD python -c "print('OK')" || exit 1
