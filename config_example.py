@@ -3,8 +3,8 @@
 
 # Binance API Keys
 # Not: API oluştururken "Enable Futures" iznini aktifleştirin
-BINANCE_API_KEY = "your_api_key_here"
-BINANCE_API_SECRET = "your_api_secret_here"
+BINANCE_API_KEY = "TEVrZYrPEX02qX6Zauq6XxB1bKUxTjBV7cCkTWFrr55G1WqZh8YVma2eOaVMsUbA"
+BINANCE_API_SECRET = "zJ69HXfa4QnqJg3cn1vnijXRrhXfvlfO9iYLFiMt6SjXJnPXJBRATXu0sDInEU7O"
 
 # Bot Ayarları (isteğe bağlı)
 LEVERAGE = 5

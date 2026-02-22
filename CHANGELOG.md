@@ -1,9 +1,67 @@
-# 📋 CHANGELOG - Fibonacci Trading Bots
+# 📋 CHANGELOG - Pump Sniper SHORT Bot (18.02.2026.py)
 
 Bu dosya projedeki tüm önemli değişiklikleri kaydeder.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)  
 Versiyon: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
+
+---
+
+## [3.5.0] - 2026-02-22
+
+### 🔴 Pump Tespiti — Esnek 6-Mum Pencere & Giriş Güçlendirme
+
+---
+
+### ✅ Added
+
+#### 🕯️ Esnek Pump Tespiti (detect_pump / detect_pump_at_bar / FullUniverse)
+- **6-mum rolling pencere** (`PUMP_WINDOW_CANDLES = 6`): ard arda yeşil olmak zorunda değil, araya kırmızı girebilir
+- **En az 4/6 yeşil mum** (`PUMP_MIN_GREEN_COUNT = 4`): sıralı olma şartı kaldırıldı
+- **Net kazanım >= %30** (`PUMP_MIN_PCT = 30.0`): pencere LOW→HIGH aralığı üzerinden hesaplanıyor
+- **Önceki yeşil mum gövde filtresi** (`PRE_CANDLE_GREEN_BODY_MAX_PCT = 30.0`): giriş kırmızısından önceki yeşil mum gövdesi max %30 — daha büyükse sahte reversal riski, giriş yok
+
+#### 🚨 Tek Mum Spike Koruması
+- **`GREEN_LOSS_SINGLE_BODY_PCT = 30.0`**: Zararda açık pozisyonda tek yeşil mumun gövdesi >= %30 ise **anında kapat** (`GREEN-SPIKE`)
+- Gövde < %30 ise eski 2xGREEN-LOSS kuralı geçerli (bkz. v3.4.0)
+
+#### 🔁 Yeniden Giriş — SL/TSL Çıkışında da Aktif
+- `consumed_signals.discard(sym)` artık SL ve TSL çıkışlarında da çağrılıyor
+- Aynı coin yeni pump koşulunu sağlarsa her çıkış sonrası tekrar girilir
+
+### 🔧 Changed
+- `ENTRY_RED_BODY_MIN_PCT`: 2.0 → **4.0** (daha güçlü reversal teyidi)
+- Pump tespitinde `PUMP_CANDLE_BODY_MIN_PCT` ve `MIN_VOLUME_USDT` kullanımı **kaldırıldı** (Config'de tanımlı ama logic dışı)
+
+---
+
+## [3.4.0] - 2026-02-22
+
+### 🟠 Zararda 2x Yeşil Mum Çıkış Kuralı
+
+---
+
+### ✅ Added
+- **`TradeRecord.consec_green_loss`** sayacı: zararda arka arkaya yeşil kapanış sayısını takip eder
+- **Stage 4 yeniden yazıldı** (Live Bot / Backtester / FullUniverse):
+  - Zararda yeşil kapanış → sayaç +1
+  - 2. ardışık zararda yeşil → `2xGREEN-LOSS` ile pozisyon kapatılır
+  - Kırmızı veya kârda yeşil kapanış → sayaç sıfırlanır
+  - Eski `GREEN_LOSS_MIN_BODY_PCT` (%6 gövde filtresi) **kaldırıldı**
+
+---
+
+## [3.3.0] - 2026-02-22
+
+### 🛑 HIGH-Bazlı Stop Loss & Margin Kayıp Sınırı
+
+---
+
+### ✅ Added
+- **HIGH-based SL tetiklemesi**: `bar["high"] >= trade.stop_loss` → çıkış tam SL fiyatından (`stop_market` simülasyonu)
+- **Margin kayıp sınırı**: `pnl_usd = max(pnl_usd, -trade.position_size_usdt)` — max kayıp = margin (likidasyona karşı koruma)
+- **`GREEN_LOSS_MIN_BODY_PCT = 6.0`** Config'e eklendi
+- **`PUMP_CONSECUTIVE_GREEN = 4`** Config'e eklendi
 
 ---
 
