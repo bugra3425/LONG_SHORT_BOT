@@ -10,28 +10,45 @@ logger = logging.getLogger("notifier")
 
 # .env'den direkt oku (18.02.2026.py ile uyumlu)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # Virgülle ayrılmış: "123456,789012"
 
 _BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
+# Çoklu chat ID desteği
+def _get_chat_ids():
+    """Virgülle ayrılmış chat ID'leri listeye çevir"""
+    if not TELEGRAM_CHAT_ID:
+        return []
+    return [cid.strip() for cid in TELEGRAM_CHAT_ID.split(",") if cid.strip()]
+
 
 async def _send_async(text: str, parse_mode: str = "HTML"):
-    """Async Telegram mesajı gönder"""
+    """Async Telegram mesajı gönder - Çoklu chat ID desteği"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("⚠️ Telegram ayarları eksik, bildirim gönderilmedi")
         return
 
+    chat_ids = _get_chat_ids()
+    if not chat_ids:
+        logger.warning("⚠️ Geçerli chat ID bulunamadı")
+        return
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            await client.post(
-                f"{_BASE_URL}/sendMessage",
-                json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": text,
-                    "parse_mode": parse_mode,
-                    "disable_web_page_preview": True,
-                },
-            )
+            # Her chat ID'ye ayrı ayrı gönder
+            for chat_id in chat_ids:
+                try:
+                    await client.post(
+                        f"{_BASE_URL}/sendMessage",
+                        json={
+                            "chat_id": chat_id,
+                            "text": text,
+                            "parse_mode": parse_mode,
+                            "disable_web_page_preview": True,
+                        },
+                    )
+                except Exception as e:
+                    logger.debug(f"📵 Chat ID {chat_id} gönderilemedi: {type(e).__name__}")
     except Exception as e:
         # Timeout ve bağlantı hatalarını sessizce geç, sadece kritik hataları logla
         error_str = str(e)
