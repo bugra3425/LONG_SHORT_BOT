@@ -1,8 +1,80 @@
-__pycache__/
-*.pyc
-.venv/
-.vscode/
-.envS
+# ==============================================================================
+# Git Ignore - Pump & Dump Reversion Bot
+# ==============================================================================
 
-# API Configuration (contains sensitive data)
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+.virtualenv/
+
+# Environment & Secrets - ÇOK ÖNEMLİ!
+.env
+.env.local
+.env.*.local
 config.py
+secrets/
+*.key
+*.pem
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs & Data
+logs/
+*.log
+*.sqlite
+*.db
+dump.rdb
+
+# Backtest Results
+backtest_trades.csv
+backtest_positions.csv
+backtest_results.log
+temp_backtest_data/
+backtest_data/
+*.csv
+
+# Recovery & Backup
+recovery/
+backup/
+*.bak
+
+# OS Files
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Agent & Temp
+.agent/
+tmp/
+temp/
+
+# Docker (optional - Northflank builds'de kullanılabilir)
+# .dockerignore
+# docker-compose.override.yml
+

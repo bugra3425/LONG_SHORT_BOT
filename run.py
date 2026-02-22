@@ -1,0 +1,13 @@
+"""
+🚀 Bugra-Bot Entry Point
+"""
+import sys
+import os
+
+# src/ dizinini Python path'e ekle
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+
+from bot.main import main
+
+if __name__ == "__main__":
+    main()

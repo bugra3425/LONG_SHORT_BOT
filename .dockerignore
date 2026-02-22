@@ -1,0 +1,90 @@
+# ==============================================================================
+# Docker Ignore - Northflank Deployment
+# Container'a dahil edilmeyecek dosyalar
+# ==============================================================================
+
+# Git
+.git
+.gitignore
+.github
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment files (secrets)
+.env
+.env.local
+.env.*.local
+config.py
+
+# Logs
+*.log
+logs/
+*.sqlite
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docker
+.dockerignore
+Dockerfile
+docker-compose.yml
+.docker/
+
+# Documentation
+*.md
+!README.md
+docs/
+
+# Recovery & Backup
+recovery/
+backup/
+*.bak
+
+# Scripts (local development)
+scripts/
+start_*.bat
+
+# Test files
+tests/
+test_*.py
+*_test.py
+
+# Redis data
+dump.rdb
+
+# Miscellaneous
+.commitlintrc.json
+.editorconfig
+*.csv
+*.xlsx
+s22.02.2026
+_check_*.py
+_pnl_calc.py
