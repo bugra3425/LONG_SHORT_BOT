@@ -342,21 +342,40 @@ class PumpSnifferBot:
         """
         Bir async exchange fonksiyonunu güvenli şekilde çağır.
         Network timeout ve rate-limit hatalarında otomatik yeniden dene.
+        Coğrafi kısıtlama (HTTP 451) hatalarını yakala ve bildir.
         """
         for attempt in range(1, retries + 1):
             try:
                 return await coro_func(*args, **kwargs)
+            
+            except ccxt.AuthenticationError as e:
+                # API key hatası — retry yapma
+                log.error(f"🔐 API key hatası: {e}")
+                log.error("   Lütfen BINANCE_API_KEY ve BINANCE_API_SECRET kontrolü yapın!")
+                raise
+            
+            except ccxt.PermissionDenied as e:
+                # Coğrafi kısıtlama (HTTP 451) — retry yapma
+                log.error(f"🚫 Binance erişim engeli (HTTP 451): {e}")
+                log.error("   Sunucu coğrafi olarak kısıtlanmış bölgede!")
+                log.error("   ⚡ Çözüm 1: Railway.app kullanın (RAILWAY_DEPLOYMENT.md)")
+                log.error("   ⚡ Çözüm 2: Türkiye/Asya lokasyonlu VPS")
+                raise
+            
             except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
                 log.warning(f"[Ağ Hatası] Deneme {attempt}/{retries}: {e}")
                 if attempt < retries:
                     await asyncio.sleep(2 ** attempt)
+            
             except ccxt.RateLimitExceeded:
                 wait = 5 * attempt
                 log.warning(f"[Rate-Limit] {wait}s bekleniyor…")
                 await asyncio.sleep(wait)
+            
             except ccxt.ExchangeError as e:
                 log.error(f"[Exchange Hatası] {e}")
                 raise
+        
         raise ccxt.NetworkError(f"{retries} deneme sonrası başarısız oldu.")
 
     # ─────────────────────────────────────────────────────────────────
