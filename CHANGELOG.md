@@ -7,6 +7,22 @@ Versiyon: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [3.6.1] - 2026-02-22
+
+### 🛠️ PnL Hesap Aracı Eklendi
+
+---
+
+### ✅ Added
+
+#### 📊 `_pnl_calc.py` — Sembol Bazlı PnL Hesaplayıcı
+- Backtest sonuçlarından kopyalanan sembol/değer listesini parse ederek özetler
+- **Çıktılar:** Toplam sembol sayısı, kârlı/zararlı sembol adedi, kazanma oranı, brüt kâr/zarar, NET PnL, Profit Factor
+- En iyi 10 ve en kötü 10 sembol sıralaması
+- Bağımsız yardımcı script — herhangi bir bota bağımlılığı yok
+
+---
+
 ## [3.6.0] - 2026-02-22
 
 ### 🐛 BT-END Fiyat Hatası Düzeltildi & Tarih Formatı
