@@ -256,7 +256,7 @@ class Config:
     ENTRY_RED_BODY_MIN_PCT = 4.0         # Giriş kırmızı mumun gövdesi min %4 olmalı (solid reversal)
     PRE_CANDLE_GREEN_BODY_MAX_PCT = 30.0  # Giriş öncesi yeşil mumun gövdesi max %30 (sahte kırmızı filtresi)
     GREEN_LOSS_MIN_BODY_PCT = 6.0        # Kullanılmıyor (gerçe dönük uyumluluk)
-    GREEN_LOSS_SINGLE_BODY_PCT = 30.0    # Zararda tek yeşil mum gövdesi >= %30 ise anında çık (spike riski)
+    GREEN_LOSS_SINGLE_BODY_PCT = 10.0    # Zararda tek yeşil mum gövdesi >= %10 → anında çık (reversal olmadı sinyali)
     ANTI_ROCKET_SINGLE_CANDLE_PCT = 30.0  # Tetikleyiciden önceki mum tek başına >= %30 çıktıysa giriş yok (boğa bayrağı)
     MIN_VOLUME_USDT     = 10_000_000.0   # Pump penceresindeki (6 mum) toplam hacim min 10M USDT olmalı
 
@@ -268,8 +268,8 @@ class Config:
     SL_ABOVE_ENTRY_PCT  = 15.0           # SL: Giriş fiyatının TAM %15 üstü (entry × 1.15)
     BREAKEVEN_DROP_PCT  = 7.0            # Stage 1: %7 düşüşte SL → entry (breakeven)
     TSL_ACTIVATION_DROP_PCT = 7.0        # Stage 2: %7 düşüşte Trailing Stop aktif
-    TSL_TRAIL_PCT       = 3.0            # TSL mesafesi: SL = lowest_low × 1.03
-    #   Örnek: entry=1.00, lowest_low=0.80 → SL=0.824 (en az +%52 ROI garanti)
+    TSL_TRAIL_PCT       = 4.0            # TSL mesafesi: SL = lowest_low × 1.04
+    #   Örnek: entry=1.00, lowest_low=0.80 → SL=0.832 (en az +%48 ROI garanti)
 
     # ── Module 4 — Çıkış yalnızca SL / BE / TSL ile ─────────────────
     #   True Engulfing kaldırıldı — çıkış yalnızca SL/TSL tetiklenmesiyle
@@ -777,21 +777,21 @@ class PumpSnifferBot:
                 # ── Stage 4: Zararda yeşil mum → SHORT kapat ───────────────────
                 if curr["close"] > curr["open"] and curr["close"] > trade.entry_price:
                     green_body_pct = (curr["close"] - curr["open"]) / curr["open"] * 100.0
-                    # Tek mumda >= %30 spike → anında kapat
+                    # Zararda tek yeşil mum gövdesi >= %10 → anında kapat (reversal olmadı)
                     if green_body_pct >= Config.GREEN_LOSS_SINGLE_BODY_PCT:
                         exit_p  = curr["close"]
                         pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
                         pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
                         trade.exit_time   = datetime.now(timezone.utc).isoformat()
                         trade.exit_price  = exit_p
-                        trade.exit_reason = "GREEN-SPIKE"
+                        trade.exit_reason = "GREEN-10"
                         trade.pnl_pct     = round(pnl_pct * 100, 4)
                         trade.pnl_usdt    = round(pnl_usd, 2)
                         self.trade_history.append(trade)
                         closed.append(sym)
                         self._post_exit_price[sym] = exit_p
                         self._new_push[sym] = False
-                        log.info(f"  🟠 GREEN-SPIKE: {sym}  Gövde: %{green_body_pct:.1f}  Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT")
+                        log.info(f"  🟠 GREEN-10: {sym}  Gövde: %{green_body_pct:.1f}  Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT")
                         continue
                     # Küçük zararda yeşil → sayacı artır, 2'de kapat
                     trade.consec_green_loss += 1
@@ -916,14 +916,23 @@ class Backtester:
     """
 
     def __init__(self, symbols: List[str] = None, days: int = None,
-                 initial_capital: float = None):
+                 initial_capital: float = None,
+                 start_dt: datetime = None, end_dt: datetime = None):
         self.symbols   = symbols or Config.BACKTEST_SYMBOLS
-        self.days      = days or Config.BACKTEST_DAYS
         self.capital   = initial_capital or Config.BACKTEST_INITIAL_CAPITAL
         self.exchange  = None   # async init'te set edilecek
         self.all_data: Dict[str, pd.DataFrame] = {}
         self.trades: List[TradeRecord] = []
         self.equity_curve: List[float] = []
+
+        # Tarih aralığı: start_dt/end_dt verilmişse kullan, yoksa days'e göre
+        if start_dt is not None and end_dt is not None:
+            self.start_dt = start_dt.replace(tzinfo=timezone.utc) if start_dt.tzinfo is None else start_dt
+            self.end_dt   = end_dt.replace(tzinfo=timezone.utc)   if end_dt.tzinfo is None else end_dt
+        else:
+            _days = days or Config.BACKTEST_DAYS
+            self.end_dt   = datetime.now(timezone.utc)
+            self.start_dt = self.end_dt - timedelta(days=_days)
 
     # ─────────────────────────────────────────────────────────────────
     # 3.1  VERİ ÇEKME
@@ -935,19 +944,20 @@ class Backtester:
 
     async def _fetch_historical(self, symbol: str) -> pd.DataFrame:
         """
-        Belirli bir sembolün BACKTEST_DAYS günlük 4H verilerini çek.
-        Binance çekim limiti genelde 1500 mum; 60 gün × 6 mum/gün = 360 → yeterli.
+        Belirli bir sembolün tarih aralığındaki 4H verilerini çek.
+        Pump window için start_dt'den 6 mum (24 saat) önce başla.
         """
-        since = self.exchange.parse8601(
-            (datetime.now(timezone.utc) - timedelta(days=self.days)).isoformat()
-        )
+        fetch_start = self.start_dt - timedelta(hours=Config.PUMP_WINDOW_CANDLES * 4)
+        since_ms    = int(fetch_start.timestamp() * 1000)
+        until_ms    = int(self.end_dt.timestamp() * 1000)
         all_candles = []
-        limit = 500  # Binance'in önerdiği tek çekim limiti
+        limit = 500
+        since_cur = since_ms
 
         while True:
             try:
                 candles = await self.exchange.fetch_ohlcv(
-                    symbol, Config.TIMEFRAME, since=since, limit=limit
+                    symbol, Config.TIMEFRAME, since=since_cur, limit=limit
                 )
             except Exception as e:
                 log.warning(f"  {symbol} veri çekme hatası: {e}")
@@ -956,9 +966,10 @@ class Backtester:
             if not candles:
                 break
             all_candles.extend(candles)
-            since = candles[-1][0] + 1  # son mum timestamp + 1ms
-            if len(candles) < limit:
+            last_ts = candles[-1][0]
+            if last_ts >= until_ms or len(candles) < limit:
                 break
+            since_cur = last_ts + 1
             await asyncio.sleep(0.3)
 
         if not all_candles:
@@ -984,7 +995,7 @@ class Backtester:
                 continue
             self.all_data[sym] = df
             log.info(f"  ✔ {sym}: {len(df)} mum yüklendi  "
-                     f"({df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')})")
+                     f"({df.index[0].strftime('%d.%m.%Y')} → {df.index[-1].strftime('%d.%m.%Y')})")
             await asyncio.sleep(0.2)
 
         await self.exchange.close()
@@ -1086,7 +1097,7 @@ class Backtester:
 
             for i in range(start_bar, len(df)):
                 bar      = df.iloc[i]
-                bar_time = df.index[i].strftime("%Y-%m-%d %H:%M")
+                bar_time = df.index[i].strftime("%d.%m.%Y %H:%M")
 
                 # ═══════════════════════════════════════════════════════
                 # (A) AKTİF TRADE → TSL / GREEN CANDLE KONTROL
@@ -1123,7 +1134,7 @@ class Backtester:
                     # Stage 3: SL kontrolü (HIGH-BASED)
                     # Exchange stop_market emri mum içi HIGH stop fiyatına değer değmez tetiklenir
                     if bar["high"] >= trade.stop_loss:
-                        exit_p  = trade.stop_loss  # Gerçek çıkış = tam SL fiyatı (stop_market)
+                        exit_p  = trade.stop_loss
                         pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
                         pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
                         pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin (likit sınırı)
@@ -1148,7 +1159,7 @@ class Backtester:
                     # Stage 4: Zararda yeşil mum → SHORT kapat
                     if bar["close"] > bar["open"] and bar["close"] > trade.entry_price:
                         green_body_pct = (bar["close"] - bar["open"]) / bar["open"] * 100.0
-                        # Tek mumda >= %30 spike → anında kapat
+                        # Zararda tek yeşil mum gövdesi >= %10 → anında kapat (reversal olmadı)
                         if green_body_pct >= Config.GREEN_LOSS_SINGLE_BODY_PCT:
                             exit_p  = bar["close"]
                             pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
@@ -1156,7 +1167,7 @@ class Backtester:
                             pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin
                             trade.exit_time   = bar_time
                             trade.exit_price  = exit_p
-                            trade.exit_reason = "GREEN-SPIKE"
+                            trade.exit_reason = "GREEN-10"
                             trade.pnl_pct     = round(pnl_pct * 100, 4)
                             trade.pnl_usdt    = round(pnl_usd, 2)
                             equity += pnl_usd
@@ -1167,7 +1178,7 @@ class Backtester:
                             new_push_seen = False
                             pump_info = self.detect_pump_at_bar(df, i, daily_df)
                             in_watchlist = pump_info is not None
-                            log.info(f"  [{bar_time}] 🟠 GREEN-SPIKE: {sym}  "
+                            log.info(f"  [{bar_time}] 🟠 GREEN-10: {sym}  "
                                      f"Gövde: %{green_body_pct:.1f}  Exit: {exit_p:.6f}  PnL: {pnl_usd:+.2f}")
                             continue
                         # Küçük zararda yeşil → sayacı artır, 2'de kapat
@@ -1307,11 +1318,15 @@ class Backtester:
         # ── Backtest sonu: açık kalan trade'leri kapat ────────────────
         for sym, trade in active.items():
             if sym in self.all_data and not self.all_data[sym].empty:
-                exit_p  = self.all_data[sym]["close"].iloc[-1]
+                df_sim = self.all_data[sym]
+                df_sim = df_sim[df_sim.index <= self.end_dt]
+                if df_sim.empty:
+                    continue
+                exit_p  = df_sim["close"].iloc[-1]
                 pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
                 pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
                 pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin
-                trade.exit_time   = self.all_data[sym].index[-1].strftime("%Y-%m-%d %H:%M")
+                trade.exit_time   = df_sim.index[-1].strftime("%d.%m.%Y %H:%M")
                 trade.exit_price  = exit_p
                 trade.exit_reason = "BT-END"
                 trade.pnl_pct     = round(pnl_pct * 100, 4)
@@ -1612,10 +1627,13 @@ class FullUniverseBacktester:
         print("=" * 68)
 
         # ── Ön-hesaplamalar ───────────────────────────────────────────
-        # 1) Tüm 4H timestamp birleşimi — sadece [start_dt, end_dt] aralığı
+        # 1) Tüm 4H timestamp birleşimi
+        #    sim_start: pump penceresi için start_dt'den 6 mum (24 saat) önce başla.
+        #    Böylece start_dt sınırına denk gelen pump+ilk kırmızı senaryosu kaçırılmaz.
+        sim_start = self.start_dt - timedelta(hours=Config.PUMP_WINDOW_CANDLES * 4)
         all_timestamps = sorted(
             ts for ts in set().union(*[set(df.index) for df in self.all_data.values()])
-            if self.start_dt <= ts <= self.end_dt
+            if sim_start <= ts <= self.end_dt
         )
 
         equity         = self.capital
@@ -1640,7 +1658,7 @@ class FullUniverseBacktester:
                       f"Watchlist: {len(watchlist)}",
                       end="", flush=True)
 
-            bar_str = ts.strftime("%Y-%m-%d %H:%M")
+            bar_str = ts.strftime("%d.%m.%Y %H:%M")
 
             # ══ (1) AÇIK TRADE'LERİN TSL / GREEN KONTROL ════════════
             closed = []
@@ -1681,7 +1699,7 @@ class FullUniverseBacktester:
                 # Stage 3: SL kontrolü (HIGH-BASED)
                 # Exchange stop_market emri mum içi HIGH stop fiyatına değer değmez tetiklenir
                 if bar["high"] >= trade.stop_loss:
-                    exit_p  = trade.stop_loss  # Gerçek çıkış = tam SL fiyatı (stop_market)
+                    exit_p  = trade.stop_loss
                     raw_pnl = (trade.entry_price - exit_p) / trade.entry_price
                     pnl_usd = trade.position_size_usdt * trade.leverage * raw_pnl
                     pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin (likit sınırı)
@@ -1706,7 +1724,7 @@ class FullUniverseBacktester:
                 # Stage 4: Zararda yeşil mum → SHORT kapat
                 if bar["close"] > bar["open"] and bar["close"] > trade.entry_price:
                     green_body_pct = (bar["close"] - bar["open"]) / bar["open"] * 100.0
-                    # Tek mumda >= %30 spike → anında kapat
+                    # Zararda tek yeşil mum gövdesi >= %10 → anında kapat (reversal olmadı)
                     if green_body_pct >= Config.GREEN_LOSS_SINGLE_BODY_PCT:
                         exit_p  = bar["close"]
                         raw_pnl = (trade.entry_price - exit_p) / trade.entry_price
@@ -1714,7 +1732,7 @@ class FullUniverseBacktester:
                         pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin
                         trade.exit_time   = bar_str
                         trade.exit_price  = exit_p
-                        trade.exit_reason = "GREEN-SPIKE"
+                        trade.exit_reason = "GREEN-10"
                         trade.pnl_pct     = round(raw_pnl * 100, 4)
                         trade.pnl_usdt    = round(pnl_usd, 4)
                         equity += pnl_usd
@@ -1724,7 +1742,7 @@ class FullUniverseBacktester:
                         consumed_signals.discard(sym)  # Çıkış sonrası yeniden girişe izin ver
                         post_exit_price[sym] = exit_p
                         new_push[sym] = False
-                        print(f"\n  [{bar_str}] 🟠 GREEN-SPIKE {sym:<16}"
+                        print(f"\n  [{bar_str}] 🟠 GREEN-10  {sym:<16}"
                               f" Gövde: %{green_body_pct:.1f}  exit: {exit_p:.6f}  PnL: {pnl_usd:>+8.4f}$"
                               f"  Equity: {equity:.4f}$")
                         continue
@@ -1932,11 +1950,14 @@ class FullUniverseBacktester:
             if sym not in self.all_data:
                 continue
             df     = self.all_data[sym]
-            exit_p = df["close"].iloc[-1]
+            df_sim = df[df.index <= self.end_dt]
+            if df_sim.empty:
+                continue
+            exit_p = df_sim["close"].iloc[-1]
             raw_pnl = (trade.entry_price - exit_p) / trade.entry_price
             pnl_usd = trade.position_size_usdt * trade.leverage * raw_pnl
             pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin
-            trade.exit_time   = df.index[-1].strftime("%Y-%m-%d %H:%M")
+            trade.exit_time   = df_sim.index[-1].strftime("%d.%m.%Y %H:%M")
             trade.exit_price  = exit_p
             trade.exit_reason = "BT-END"
             trade.pnl_pct     = round(raw_pnl * 100, 4)
@@ -2033,7 +2054,7 @@ async def main_backtest(full_universe: bool = False,
     if full_universe:
         bt = FullUniverseBacktester(start_dt=start_dt, end_dt=end_dt)
     else:
-        bt = Backtester()
+        bt = Backtester(start_dt=start_dt, end_dt=end_dt)
     await bt.load_data()
     bt.run_backtest()
     bt.print_report()
@@ -2125,9 +2146,30 @@ def main():
                 Config.BACKTEST_INITIAL_CAPITAL = float(cap_input)
             except ValueError:
                 pass
+
+        # Tarih aralığı özelleştirme
+        bt_start_dt = None
+        bt_end_dt   = None
+        start_input = input("  Başlangıç tarihi? (GG.AA.YYYY, örn. 01.01.2026) [Enter = son 31 gün]: ").strip()
+        if start_input:
+            try:
+                bt_start_dt = datetime.strptime(start_input, "%d.%m.%Y")
+                end_input = input("  Bitiş tarihi? (GG.AA.YYYY, örn. 12.01.2026) [Enter = bugün]: ").strip()
+                bt_end_dt = datetime.strptime(end_input, "%d.%m.%Y") if end_input else datetime.now()
+                bt_end_dt = bt_end_dt.replace(hour=23, minute=59, second=59)
+            except ValueError:
+                print("  Geçersiz tarih formatı, son 31 gün kullanılıyor.")
+                bt_start_dt = None
+                bt_end_dt   = None
+
         print()
-        print(f"  Başlatılıyor: 8 sembol  |  {Config.BACKTEST_INITIAL_CAPITAL}$")
-        asyncio.run(main_backtest(full_universe=False))
+        if bt_start_dt:
+            print(f"  Başlatılıyor: 8 sembol  |  {Config.BACKTEST_INITIAL_CAPITAL}$  |  "
+                  f"{bt_start_dt.strftime('%d.%m.%Y')} → {bt_end_dt.strftime('%d.%m.%Y')}")
+            asyncio.run(main_backtest(full_universe=False, start_dt=bt_start_dt, end_dt=bt_end_dt))
+        else:
+            print(f"  Başlatılıyor: 8 sembol  |  {Config.BACKTEST_INITIAL_CAPITAL}$")
+            asyncio.run(main_backtest(full_universe=False))
 
     elif secim == "3":
         print()

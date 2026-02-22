@@ -7,6 +7,28 @@ Versiyon: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [3.6.0] - 2026-02-22
+
+### 🐛 BT-END Fiyat Hatası Düzeltildi & Tarih Formatı
+
+---
+
+### 🔧 Fixed
+
+#### 📅 BT-END Hatalı Çıkış Fiyatı (Her İki Backtest Sistemi)
+- **Bug:** `df["close"].iloc[-1]` ifadesi `all_data` içinde `end_dt` sonrasını da kapsayan tüm veriyi kullanıyordu
+  - Örnek: RIVER/USDT backtest end_dt=25.01.2026 iken `all_data` Şubat 2026 verisi içeriyordu → BT-END fiyatı 8.22 (yanlış), gerçekte ~69.78 olması gerekiyordu
+- **Düzeltme:** `df_sim = df[df.index <= self.end_dt]` → `df_sim["close"].iloc[-1]` ile `end_dt`'e kadarki son bar kapanışı kullanılıyor
+- Her iki backtest sınıfında (`Backtester` ve `FullUniverseBacktester`) düzeltildi
+
+### 🔧 Changed
+
+#### 🗓️ Tarih Formatı → Türk Standardı
+- Tüm tarih/saat çıktıları `%Y-%m-%d %H:%M` → **`%d.%m.%Y %H:%M`** formatına alındı
+- Etkilenen yerler: `bar_time`, `bar_str`, `trade.exit_time` (BT-END dahil), log mesajları
+
+---
+
 ## [3.5.0] - 2026-02-22
 
 ### 🔴 Pump Tespiti — Esnek 6-Mum Pencere & Giriş Güçlendirme
