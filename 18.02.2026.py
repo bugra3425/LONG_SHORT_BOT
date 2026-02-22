@@ -223,11 +223,11 @@ class Config:
     Tüm bot parametrelerini tek yerde topluyoruz.
 
     STRATEJİ (v3 — Refined Scalper):
-      Module 1: Top 10 Daily Gainer → Watchlist
-      Module 2: 4H Kapanan Mum → SHORT (pump sonrası ilk mum, renk fark etmez)
-      Module 3: SL entry'nin %15 üstü (entry × 1.15), TP = entry×0.92 (sabit %8), BE @ %4 düşüş
-      Module 4: Çıkış yalnızca SL / BE / TSL ile (True Engulfing kaldırıldı)
-      Module 5: 24 saat cooldown sonra yeniden giriş
+      Module 1: Top 10 Rolling Pump (24H/6×4H bazlı) → Watchlist
+      Module 2: 4H Kapanan Kırmızı Mum → SHORT (pump sonrası giriş)
+      Module 3: SL entry'nin %15 üstü (entry × 1.15), BE @ %7 düşüş, TSL @ %7 düşüş
+      Module 4: Çıkış yalnızca SL / BE / TSL ile (dinamik yönetim)
+      Module 5: Yeni pump sonrası yeniden giriş (fresh push koşulu)
     """
 
     # ── Exchange bağlantı ─────────────────────────────────────────────
@@ -238,15 +238,13 @@ class Config:
     DEMO_MODE           = True           # True → demo.binance.com | False → canlı borsa
     MIN_NOTIONAL_USDT   = 5.0            # Binance minimum emir değeri (USDT)
 
-    # ── Module 1 — RADAR (Top 10 Daily Gainers) ──────────────────────
+    # ── Module 1 — RADAR (Top 10 Rolling Pump - 24H/6×4H) ──────────────
     EXCLUDED_BASES      = {
         # Major-cap coinleri hariç tut
         "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE",
     }
-    DAILY_SCAN_TIMEFRAME = "1d"          # Pump tarama zaman dilimi
-    PUMP_LOOKBACK_1D    = 2              # Mevcut + önceki günlük mum
-    PUMP_MIN_PCT        = 30.0           # Günlük mum kazancı minimum %30
-    TOP_N_GAINERS       = 10             # Sadece en yüksek 10 gainer watchlist'e alınır
+    PUMP_MIN_PCT        = 30.0           # 24H rolling pump (son 6×4H mum) minimum %30
+    TOP_N_GAINERS       = 10             # Sadece en yüksek 10 pump watchlist'e alınır
     SCAN_INTERVAL_SEC   = 900            # Tarama aralığı (15 dk)
 
     # ── Module 2 — TRIGGER (Pure Price Action) ───────────────────────
@@ -428,13 +426,13 @@ class PumpSnifferBot:
 
     async def detect_pump(self, symbol: str) -> Optional[WatchlistItem]:
         """
-        Module 1 — THE RADAR: Son 6 adet 4H mumda (24 saatlik rolling pencere)
-        net yükseliş >= %30 ve yüksek, düşükten SONRA gerçekleşmiş mi?
+        Module 1 — THE RADAR: Son 6×4H mumda (24 saatlik rolling pencere)
+        net yükseliş >= %30 ve en az 4 yeşil mum kontrolü.
 
-        rolling_low  = 6 mumun en düşük LOW'ı
-        rolling_high = 6 mumun en yüksek HIGH'ı
-        net_gain = (rolling_high - rolling_low) / rolling_low
-        Geçerli pump: net_gain >= PUMP_MIN_PCT VE high_idx > low_idx (yön yukarı)
+        Koşullar:
+        1. Son 6×4H mumda en az 4 yeşil mum olmalı
+        2. rolling_high - rolling_low arası >= %30 kazanç
+        3. 6 mumdaki toplam hacim >= 10M USDT (kod içinde kontrol edilmiyor, opsiyonel)
         """
         n = Config.PUMP_WINDOW_CANDLES  # 6
         try:
@@ -475,11 +473,11 @@ class PumpSnifferBot:
 
     async def scan_universe(self):
         """
-        Module 1 — THE RADAR: Tüm universe'ü tara → Top 10 günlük gainer → watchlist.
-        Sadece en yüksek %30+ kazanç yapan 10 coin izlenir.
+        Module 1 — THE RADAR: Tüm universe'ü tara → Top 10 rolling pump (24H/6×4H) → watchlist.
+        Son 6×4H mumda (24 saat) en yüksek %30+ pump yapan 10 coin izlenir.
         """
         universe = await self.fetch_universe()
-        log.info(f"🔍 {len(universe)} coin taranıyor (1D kazanç ≥ %{Config.PUMP_MIN_PCT})…")
+        log.info(f"🔍 {len(universe)} coin taranıyor (24H pump ≥ %{Config.PUMP_MIN_PCT}, 6×4H bazlı)…")
 
         all_pumps: List[WatchlistItem] = []
 
