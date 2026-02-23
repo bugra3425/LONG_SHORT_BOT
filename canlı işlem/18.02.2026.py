@@ -1043,7 +1043,7 @@ class PumpSnifferBot:
         while self.running:
             try:
                 await self.scan_universe()
-                log.info(f"⏳ Sonraki universe taraması: {Config.SCAN_INTERVAL_SEC}s sonra…")
+                log.info(f"⏳ [v3.5] Sonraki universe taraması {Config.SCAN_INTERVAL_SEC}s sonra başlayacak…")
             except Exception as e:
                 log.error(f"🔴 Scanner hatası: {e}")
             await asyncio.sleep(Config.SCAN_INTERVAL_SEC)
@@ -1132,7 +1132,7 @@ class PumpSnifferBot:
         """
         self.running = True
         log.info("=" * 68)
-        log.info("  PUMP & DUMP REVERSION BOT v3 — DUAL-LOOP BAŞLATILDI")
+        log.info("  PUMP & DUMP REVERSION BOT v3.5 — DUAL-LOOP BAŞLATILDI")
         log.info(f"  Kaldıraç: x{Config.LEVERAGE}  |  "
                  f"Top {Config.TOP_N_GAINERS} Gainer  |  "
                  f"Risk/trade: %{Config.RISK_PER_TRADE_PCT}")
