@@ -438,6 +438,48 @@ class PumpSnifferBot:
         df.set_index("timestamp", inplace=True)
         return df
 
+    def _remove_live_candle(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        """
+        Eğer son mum henüz kapanmamışsa (canlı mum), onu DataFrame'den at.
+        Kapanmış mumları korur.
+        
+        Timeframe'e göre mumun kapanış zamanını hesaplar:
+          - Son mumun timestamp'i = mum başlangıcı
+          - Mum bitişi = başlangıç + timeframe süresi
+          - Eğer şu an < mum bitişi → canlı mum, at
+          - Eğer şu an >= mum bitişi → kapanmış mum, koru
+        """
+        if len(df) == 0:
+            return df
+        
+        # Timeframe süresini hesapla
+        tf_str = timeframe.lower()
+        if 'h' in tf_str:
+            tf_delta = timedelta(hours=int(tf_str.replace('h', '')))
+        elif 'm' in tf_str:
+            tf_delta = timedelta(minutes=int(tf_str.replace('m', '')))
+        elif 'd' in tf_str:
+            tf_delta = timedelta(days=int(tf_str.replace('d', '')))
+        else:
+            tf_delta = timedelta(hours=4)  # Default 4h
+        
+        # Son mumun timestamp'i (başlangıç zamanı)
+        last_candle_start = df.index[-1]
+        
+        # Mumun kapanış zamanı
+        last_candle_end = last_candle_start + tf_delta
+        
+        # Şu anki zaman (UTC)
+        now_utc = datetime.now(timezone.utc)
+        
+        # Eğer mum henüz kapanmadıysa (şu an < kapanış zamanı), canlı mumdur → at
+        if now_utc < last_candle_end:
+            log.debug(f"  Canlı mum tespit edildi ({last_candle_start}), atılıyor...")
+            return df.iloc[:-1]
+        else:
+            # Mum zaten kapanmış, tüm veriyi döndür
+            return df
+
     async def detect_pump(self, symbol: str) -> Optional[WatchlistItem]:
         """
         Module 1 — THE RADAR: Son 6×4H mumda (24 saatlik rolling pencere)
@@ -451,7 +493,7 @@ class PumpSnifferBot:
         n = Config.PUMP_WINDOW_CANDLES  # 6
         try:
             df_4h = await self.fetch_ohlcv(symbol, Config.TIMEFRAME, limit=n + 5)
-            df_4h = df_4h.iloc[:-1]  # ⚠️ Kapanmamış canlı mumu at — sadece tamamlanmış mumlar
+            df_4h = self._remove_live_candle(df_4h, Config.TIMEFRAME)  # Canlı mumu doğru şekilde tespit et ve at
         except Exception as e:
             log.debug(f"  {symbol} 4H veri çekilemedi: {e}")
             return None
@@ -887,7 +929,7 @@ class PumpSnifferBot:
             try:
                 df = await self.fetch_ohlcv(sym, Config.TIMEFRAME,
                                             limit=Config.BB_LENGTH + 5)
-                df = df.iloc[:-1]  # ⚠️ Kapanmamış canlı mumu at
+                df = self._remove_live_candle(df, Config.TIMEFRAME)  # ✅ Canlı mumu doğru şekilde tespit et ve at
                 if df.empty:
                     continue
 
@@ -1079,7 +1121,7 @@ class PumpSnifferBot:
                     try:
                         df = await self.fetch_ohlcv(sym, Config.TIMEFRAME,
                                                     limit=Config.BB_LENGTH + 10)
-                        df = df.iloc[:-1]  # ⚠️ Kapanmamış canlı mumu at
+                        df = self._remove_live_candle(df, Config.TIMEFRAME)  # ✅ Canlı mumu doğru şekilde tespit et ve at
 
                         # Module 5: Yeni Push kontrolü (çıkış sonrası yeniden giriş)
                         if sym in self._post_exit_price:
@@ -1103,6 +1145,7 @@ class PumpSnifferBot:
                             sig_ts = str(signal["signal_ts"])
                             if self._processed_signals.get(sym) == sig_ts:
                                 # Bu mumda zaten işlem açıldı veya denendi
+                                log.debug(f"  ⏭️  {sym}: Bu mum için sinyal zaten işlendi ({sig_ts})")
                                 continue
 
                             log.info(f"  🎯 [INSTANT] SİNYAL: {sym}  |  {'  '.join(signal['reasons'])}")
