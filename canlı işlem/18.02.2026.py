@@ -587,6 +587,7 @@ class PumpSnifferBot:
         result["score"] = 1
         result["entry_price"] = curr["close"]
         result["entry_candle_open"] = curr["open"]
+        result["signal_ts"] = df.index[-1]  # Sinyal mumunun kapanış zamanı
         result["reasons"].append("KIRMIZI MUM ✓ → SHORT")
         return result
 
@@ -742,6 +743,8 @@ class PumpSnifferBot:
         except Exception as e:
             log.error(f"  ❌ Emir gönderilemedi ({symbol}): {e}")
 
+        # Market emri ID'si varsa, SL hata verse bile bu işlemi takip etmeliyiz
+        # Aksi halde bot sonsuz döngüde sürekli yeni market emri açar
         self.active_trades[symbol] = trade
         log.info(
             f"  ✅ SHORT AÇILDI [{('DEMO 🧪' if Config.DEMO_MODE else 'CANLI ⚠️')}]: {symbol}\n"
@@ -1065,6 +1068,16 @@ class PumpSnifferBot:
                                      f"Yeni zirve: {item.pump_high:.6f}")
 
                         if signal["triggered"]:
+                            # 🕒 SİNYAL TAZELİK KONTROLÜ (Stale Signal Filter)
+                            # Mum kapandıktan sonra en fazla 30 dk geçmiş olmalı
+                            signal_time = signal["signal_ts"]
+                            now_utc = datetime.now(timezone.utc)
+                            diff_mins = (now_utc - signal_time).total_seconds() / 60.0
+                            
+                            if diff_mins > 30:
+                                log.info(f"  ⏳ Sinyal bayat: {sym} (Kapanıştan {diff_mins:.1f} dk geçmiş) — atlanıyor.")
+                                continue
+
                             log.info(f"  🎯 SİNYAL: {sym}  |  {'  '.join(signal['reasons'])}")
 
                             # Equity al
