@@ -552,6 +552,31 @@ class PumpSnifferBot:
         if len(df) < 2:
             return result
 
+        # ── KOŞUL 0: Tazelik Kontrolü (Freshness Window) — Maks 5 Dakika ──────
+        # CCXT timestamp'i mumun BAŞLANGIÇ zamanıdır. (Örn: 16:00:00)
+        # Kapanış zamanı = başlangıç + timeframe. (Örn: 20:00:00)
+        candle_start_dt = df.index[-1]
+        
+        # Timeframe'e göre süre hesapla
+        tf_str = Config.TIMEFRAME.lower()
+        if 'h' in tf_str:
+            tf_delta = timedelta(hours=int(tf_str.replace('h', '')))
+        elif 'm' in tf_str:
+            tf_delta = timedelta(minutes=int(tf_str.replace('m', '')))
+        elif 'd' in tf_str:
+            tf_delta = timedelta(days=int(tf_str.replace('d', '')))
+        else:
+            tf_delta = timedelta(hours=4) # Default 4h
+            
+        candle_end_dt = candle_start_dt + tf_delta
+        now_utc = datetime.now(timezone.utc)
+        diff_mins = (now_utc - candle_end_dt).total_seconds() / 60.0
+        
+        if diff_mins > 5.0:
+            result["reasons"].append(f"BAYAT SİNYAL ({diff_mins:.1f} dk önce kapandı) — Fırsat kaçtı (5dk kuralı)")
+            return result
+        # ──────────────────────────────────────────────────────────────────
+
         curr = df.iloc[-1]  # en son kapanan 4H mum
 
         # KOŞUL 1: Kırmızı mum (close < open)
@@ -1068,16 +1093,6 @@ class PumpSnifferBot:
                                      f"Yeni zirve: {item.pump_high:.6f}")
 
                         if signal["triggered"]:
-                            # 🕒 SİNYAL TAZELİK KONTROLÜ (Stale Signal Filter)
-                            # Mum kapandıktan sonra en fazla 30 dk geçmiş olmalı
-                            signal_time = signal["signal_ts"]
-                            now_utc = datetime.now(timezone.utc)
-                            diff_mins = (now_utc - signal_time).total_seconds() / 60.0
-                            
-                            if diff_mins > 30:
-                                log.info(f"  ⏳ Sinyal bayat: {sym} (Kapanıştan {diff_mins:.1f} dk geçmiş) — atlanıyor.")
-                                continue
-
                             log.info(f"  🎯 SİNYAL: {sym}  |  {'  '.join(signal['reasons'])}")
 
                             # Equity al
