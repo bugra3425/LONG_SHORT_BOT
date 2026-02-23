@@ -729,6 +729,9 @@ class PumpSnifferBot:
 
             await self._safe_call(self.exchange.set_leverage, pos["leverage"], symbol)
 
+            # İşlem açılmadan HEMEN ÖNCE eski algo emirleri temizle (-4130 fix)
+            await self._cancel_algo_orders(symbol)
+
             order = await self._safe_call(
                 self.exchange.create_order,
                 symbol, "market", "sell", qty,
@@ -853,6 +856,8 @@ class PumpSnifferBot:
                     symbol, "market", "buy", open_qty,
                     params={"reduceOnly": True}
                 )
+                # İşlem kapandıktan HEMEN SONRA tekrar temizle
+                await self._cancel_algo_orders(symbol)
                 log.info(f"  📤 MARKET CLOSE: {symbol}  Miktar: {open_qty}")
             else:
                 log.info(f"  ℹ️ {symbol}: Binance'te açık pozisyon bulunamadı (zaten kapanmış).")
