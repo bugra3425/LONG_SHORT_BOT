@@ -258,8 +258,9 @@ class Config:
     }
     PUMP_MIN_PCT        = 30.0           # 24H rolling pump (son 6×4H mum) minimum %30
     TOP_N_GAINERS       = 10             # Sadece en yüksek 10 pump watchlist'e alınır
-    SCAN_INTERVAL_SEC   = int(os.environ.get("SCAN_INTERVAL_SECONDS", "600"))  # Tarama aralığı (default 10 dk)
-    MANAGER_INTERVAL_SEC = 5              # Trade yönetim + sinyal kontrol döngüsü (5 sn)
+    SCAN_INTERVAL_SEC   = int(os.environ.get("SCAN_INTERVAL_SECONDS", "600"))  # Universe tarama aralığı (default 10 dk)
+    MANAGER_INTERVAL_SEC = 5              # Trade yönetim döngüsü - SADECE açık trade'ler (5 sn)
+    WATCHLIST_CHECK_INTERVAL_SEC = int(os.environ.get("WATCHLIST_CHECK_SECONDS", "60"))  # Watchlist sinyal kontrolü (60 sn)
 
     # ── Module 2 — TRIGGER (Pure Price Action) ───────────────────────
     TIMEFRAME           = os.environ.get("TIMEFRAME", "4h")
@@ -1075,44 +1076,63 @@ class PumpSnifferBot:
     # ─────────────────────────────────────────────────────────────────
 
     # ─────────────────────────────────────────────────────────────────
-    # 2.4  DUAL-LOOP MİMARİSİ  (Scanner + Manager paralel)
+    # 2.4  TRI-LOOP MİMARİSİ  (Scanner + Manager + Watchlist paralel)
     # ─────────────────────────────────────────────────────────────────
 
     async def _scanner_loop(self):
         """
         DÖNGÜ 1 — SCANNER: Universe'ü tarar, watchlist günceller.
-        Bu döngü ağır API çağrıları yapar (yüzlerce coin), SCAN_INTERVAL_SEC (900s) aralıkla.
+        Bu döngü ağır API çağrıları yapar (yüzlerce coin), SCAN_INTERVAL_SEC (600s) aralıkla.
         """
         while self.running:
             try:
                 await self.scan_universe()
-                log.info(f"⏳ [v3.5] Sonraki universe taraması {Config.SCAN_INTERVAL_SEC}s sonra başlayacak…")
+                log.info(f"⏳ [v3.7] Sonraki universe taraması {Config.SCAN_INTERVAL_SEC}s sonra başlayacak…")
             except Exception as e:
                 log.error(f"🔴 Scanner hatası: {e}")
             await asyncio.sleep(Config.SCAN_INTERVAL_SEC)
 
     async def _manager_loop(self):
         """
-        DÖNGÜ 2 — MANAGER: Açık trade'leri yönetir + watchlist sinyallerini kontrol eder.
-        Her 5 saniyede bir çalışır. Sadece birkaç coinin verisini çeker → rate limit safe.
+        DÖNGÜ 2 — TRADE MANAGER: SADECE açık trade'leri yönetir (SL/TSL/BE/Green çıkış).
+        Her 5 saniyede bir çalışır. Rate limit safe — sadece açık pozisyonlar kontrol edilir.
         """
         while self.running:
             try:
-                # İş yoksa bekle (gereksiz API çağrısı yapma)
-                if not self.active_trades and not self.watchlist:
+                # Açık trade yoksa bekle (gereksiz API çağrısı yapma)
+                if not self.active_trades:
                     await asyncio.sleep(Config.MANAGER_INTERVAL_SEC)
                     continue
 
-                # (A) Açık trade'leri yönet (SL/TSL/BE/Green çıkış)
-                if self.active_trades:
-                    try:
-                        balance = await self._safe_call(self.exchange.fetch_balance)
-                        equity  = float(balance.get("total", {}).get("USDT", 10_000))
-                    except Exception:
-                        equity = 10_000
-                    await self.manage_open_trades(equity)
+                # Equity al
+                try:
+                    balance = await self._safe_call(self.exchange.fetch_balance)
+                    equity  = float(balance.get("total", {}).get("USDT", 10_000))
+                except Exception:
+                    equity = 10_000
 
-                # (B) Watchlist'teki her coini sinyal tetikleme için kontrol et
+                # Açık trade'leri yönet (SL/TSL/BE/Green çıkış)
+                await self.manage_open_trades(equity)
+
+            except Exception as e:
+                log.error(f"🔴 Trade Manager hatası: {e}")
+
+            await asyncio.sleep(Config.MANAGER_INTERVAL_SEC)
+
+    async def _watchlist_loop(self):
+        """
+        DÖNGÜ 3 — WATCHLIST SIGNAL CHECKER: Watchlist'teki coinleri sinyal için kontrol eder.
+        Her 60 saniyede bir çalışır (4H timeframe için yeterli).
+        Rate limit safe — sadece watchlist coinleri kontrol edilir.
+        """
+        while self.running:
+            try:
+                # Watchlist boşsa veya tüm slotlar doluysa bekle
+                if not self.watchlist or len(self.active_trades) >= Config.MAX_ACTIVE_TRADES:
+                    await asyncio.sleep(Config.WATCHLIST_CHECK_INTERVAL_SEC)
+                    continue
+
+                # Watchlist'teki her coini sinyal tetikleme için kontrol et
                 for sym, item in list(self.watchlist.items()):
                     if sym in self.active_trades:
                         continue
@@ -1148,7 +1168,7 @@ class PumpSnifferBot:
                                 log.debug(f"  ⏭️  {sym}: Bu mum için sinyal zaten işlendi ({sig_ts})")
                                 continue
 
-                            log.info(f"  🎯 [INSTANT] SİNYAL: {sym}  |  {'  '.join(signal['reasons'])}")
+                            log.info(f"  🎯 [v3.7] SİNYAL: {sym}  |  {'  '.join(signal['reasons'])}")
                             self._processed_signals[sym] = sig_ts  # Sinyal işlendi olarak işaretle
 
                             # Equity al
@@ -1164,38 +1184,40 @@ class PumpSnifferBot:
                                                              signal["entry_price"]),
                             )
                     except Exception as e:
-                        log.error(f"  Tetikleme hatası ({sym}): {e}")
+                        log.error(f"  Watchlist sinyal hatası ({sym}): {e}")
 
             except Exception as e:
-                log.error(f"🔴 Manager hatası: {e}")
+                log.error(f"🔴 Watchlist Checker hatası: {e}")
 
-            await asyncio.sleep(Config.MANAGER_INTERVAL_SEC)
+            await asyncio.sleep(Config.WATCHLIST_CHECK_INTERVAL_SEC)
 
     async def run(self):
         """
-        DUAL-LOOP Ana Giriş Noktası.
+        TRI-LOOP Ana Giriş Noktası.
 
-        İki paralel async görev başlatır:
-          • scanner_loop : Universe taraması (env: SCAN_INTERVAL_SECONDS)
-          • manager_loop : Trade yönetimi + sinyal kontrolü (her 5s)
+        Üç paralel async görev başlatır:
+          • scanner_loop   : Universe taraması (600s - ağır API yükü)
+          • manager_loop   : Açık trade yönetimi (5s - sadece aktif işlemler)
+          • watchlist_loop : Watchlist sinyal kontrolü (60s - yeni giriş fırsatları)
 
-        Bu sayede bot 10 dk uyurken açık işlemler yönetimsiz kalmaz ve yeni sinyallere
-        MÜKEMMEL ZAMANLAMAYLA (Instant Entry) giriş yapılır.
+        Rate limit optimizasyonu: Watchlist kontrolü her 60s → Binance ban riski yok.
         """
         self.running = True
-        log.info("=" * 68)
-        log.info("  PUMP & DUMP REVERSION BOT v3.6 — DUAL-LOOP BAŞLATILDI")
+        log.info("=" * 75)
+        log.info("  PUMP & DUMP REVERSION BOT v3.7 — TRI-LOOP BAŞLATILDI")
         log.info(f"  Kaldıraç: x{Config.LEVERAGE}  |  "
                  f"Top {Config.TOP_N_GAINERS} Gainer  |  "
                  f"Risk/trade: %{Config.RISK_PER_TRADE_PCT}")
-        log.info(f"  Scanner aralığı: {Config.SCAN_INTERVAL_SEC}s  |  "
-                 f"Manager aralığı: {Config.MANAGER_INTERVAL_SEC}s")
-        log.info("=" * 68)
+        log.info(f"  📡 Scanner: {Config.SCAN_INTERVAL_SEC}s  |  "
+                 f"⚡ Trade Manager: {Config.MANAGER_INTERVAL_SEC}s  |  "
+                 f"🎯 Watchlist: {Config.WATCHLIST_CHECK_INTERVAL_SEC}s")
+        log.info("=" * 75)
 
         try:
             await asyncio.gather(
                 self._scanner_loop(),
                 self._manager_loop(),
+                self._watchlist_loop(),
             )
 
         except KeyboardInterrupt:
