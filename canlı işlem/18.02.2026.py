@@ -331,6 +331,7 @@ class PumpSnifferBot:
         self.trade_history: List[TradeRecord] = []
         self._post_exit_price: Dict[str, float] = {}   # sym → son çıkış fiyatı (yeni push takibi)
         self._new_push: Dict[str, bool] = {}            # sym → çıkış sonrası yeni push görüldü mü?
+        self._processed_signals: Dict[str, str] = {}    # sym → son sinyal timestamp (Tekilleştirme)
         self.running = False
 
     # ─────────────────────────────────────────────────────────────────
@@ -1098,7 +1099,14 @@ class PumpSnifferBot:
                                      f"Yeni zirve: {item.pump_high:.6f}")
 
                         if signal["triggered"]:
-                            log.info(f"  🎯 SİNYAL: {sym}  |  {'  '.join(signal['reasons'])}")
+                            # Sinyal Tekilleştirme (Deduplication) — v3.6
+                            sig_ts = str(signal["signal_ts"])
+                            if self._processed_signals.get(sym) == sig_ts:
+                                # Bu mumda zaten işlem açıldı veya denendi
+                                continue
+
+                            log.info(f"  🎯 [INSTANT] SİNYAL: {sym}  |  {'  '.join(signal['reasons'])}")
+                            self._processed_signals[sym] = sig_ts  # Sinyal işlendi olarak işaretle
 
                             # Equity al
                             try:
@@ -1125,14 +1133,15 @@ class PumpSnifferBot:
         DUAL-LOOP Ana Giriş Noktası.
 
         İki paralel async görev başlatır:
-          • scanner_loop : Universe taraması (her 900s)
+          • scanner_loop : Universe taraması (env: SCAN_INTERVAL_SECONDS)
           • manager_loop : Trade yönetimi + sinyal kontrolü (her 5s)
 
-        Bu sayede bot 15 dk uyurken açık işlemler yönetimsiz kalmaz.
+        Bu sayede bot 10 dk uyurken açık işlemler yönetimsiz kalmaz ve yeni sinyallere
+        MÜKEMMEL ZAMANLAMAYLA (Instant Entry) giriş yapılır.
         """
         self.running = True
         log.info("=" * 68)
-        log.info("  PUMP & DUMP REVERSION BOT v3.5 — DUAL-LOOP BAŞLATILDI")
+        log.info("  PUMP & DUMP REVERSION BOT v3.6 — DUAL-LOOP BAŞLATILDI")
         log.info(f"  Kaldıraç: x{Config.LEVERAGE}  |  "
                  f"Top {Config.TOP_N_GAINERS} Gainer  |  "
                  f"Risk/trade: %{Config.RISK_PER_TRADE_PCT}")
