@@ -690,27 +690,41 @@ class PumpSnifferBot:
             "leverage": leverage,
         }
 
-    async def _cancel_algo_orders(self, symbol: str):
+    async def _cancel_algo_orders(self, symbol: str, retry: bool = True) -> bool:
         """
         Doküman Madde 2: Algo emirleri (STOP_MARKET/TAKE_PROFIT_MARKET) standart
         fetch_open_orders / cancel_all_orders ile görünmez. Ayrı API gerektirir.
         Bu metod hayalet algo emirleri temizler.
+        
+        v3.7: Retry + delay mekanizmalı (paranoid cleanup)
         """
         raw_sym = symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT")
-        try:
-            open_algo = await self._safe_call(
-                self.exchange.fapiPrivateGetOpenAlgoOrders,
-                {"symbol": raw_sym}
-            )
-            orders = open_algo.get("orders", []) if isinstance(open_algo, dict) else []
-            if orders:
-                await self._safe_call(
-                    self.exchange.fapiPrivateDeleteAlgoOpenOrders,
+        max_attempts = 2 if retry else 1
+        
+        for attempt in range(max_attempts):
+            try:
+                open_algo = await self._safe_call(
+                    self.exchange.fapiPrivateGetOpenAlgoOrders,
                     {"symbol": raw_sym}
                 )
-                log.info(f"  🗑️ Algo emirler temizlendi: {symbol} ({len(orders)} emir)")
-        except Exception as e:
-            log.debug(f"  Algo order sorgulama hatası ({symbol}): {e}")
+                orders = open_algo.get("orders", []) if isinstance(open_algo, dict) else []
+                if orders:
+                    await self._safe_call(
+                        self.exchange.fapiPrivateDeleteAlgoOpenOrders,
+                        {"symbol": raw_sym}
+                    )
+                    log.info(f"  🗑️ Algo emirler temizlendi: {symbol} ({len(orders)} emir)")
+                    await asyncio.sleep(0.2)  # Binance senkronizasyonu için
+                return True
+            except Exception as e:
+                if attempt < max_attempts - 1:
+                    log.debug(f"  Algo temizlik deneme {attempt+1} başarısız ({symbol}), tekrar deneniyor...")
+                    await asyncio.sleep(0.3)
+                    continue
+                else:
+                    log.warning(f"  ⚠️ Algo temizlik hatası ({symbol}): {e}")
+                    return False
+        return False
 
     async def open_short(self, symbol: str, entry_price: float,
                          pump_item: WatchlistItem, equity: float,
@@ -997,6 +1011,9 @@ class PumpSnifferBot:
                     self._new_push[sym] = False
                     # 🔥 Fiziksel market close — Binance'te pozisyonu kapat
                     await self._market_close_position(sym)
+                    # 🛡️ PARANOID CLEANUP — Ekstra güvenlik
+                    await asyncio.sleep(0.3)
+                    await self._cancel_algo_orders(sym, retry=False)
                     log.info(f"  🔴 {reason}: {sym}  |  PnL: {trade.pnl_usdt:+.2f} USDT")
                     # 📲 SL/TSL çıkış bildirimi
                     try:
@@ -1030,6 +1047,9 @@ class PumpSnifferBot:
                         self._new_push[sym] = False
                         # 🔥 Fiziksel market close — Binance'te pozisyonu kapat
                         await self._market_close_position(sym)
+                        # 🛡️ PARANOID CLEANUP — Ekstra güvenlik
+                        await asyncio.sleep(0.3)
+                        await self._cancel_algo_orders(sym, retry=False)
                         log.info(f"  🟠 GREEN-10: {sym}  Gövde: %{green_body_pct:.1f}  Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT")
                         # 📲 GREEN-10 çıkış bildirimi
                         try:
@@ -1054,6 +1074,9 @@ class PumpSnifferBot:
                         self._new_push[sym] = False
                         # 🔥 Fiziksel market close — Binance'te pozisyonu kapat
                         await self._market_close_position(sym)
+                        # 🛡️ PARANOID CLEANUP — Ekstra güvenlik
+                        await asyncio.sleep(0.3)
+                        await self._cancel_algo_orders(sym, retry=False)
                         log.info(f"  🟠 2xGREEN-LOSS: {sym}  Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT")
                         # 📲 2xGREEN-LOSS çıkış bildirimi
                         try:
@@ -1083,10 +1106,19 @@ class PumpSnifferBot:
         """
         DÖNGÜ 1 — SCANNER: Universe'ü tarar, watchlist günceller.
         Bu döngü ağır API çağrıları yapar (yüzlerce coin), SCAN_INTERVAL_SEC (600s) aralıkla.
+        
+        v3.7: Scan sonrası orphan algo temizleyici (watchlist'te olup trade'i olmayan coinler)
         """
         while self.running:
             try:
                 await self.scan_universe()
+                
+                # 🧹 ORPHAN CLEANER — Watchlist'te olup active trade'i OLMAYAN coinlerin stoplarını temizle
+                for sym in list(self.watchlist.keys()):
+                    if sym not in self.active_trades:
+                        await self._cancel_algo_orders(sym, retry=False)
+                        await asyncio.sleep(0.1)  # Rate limit koruması
+                
                 log.info(f"⏳ [v3.7] Sonraki universe taraması {Config.SCAN_INTERVAL_SEC}s sonra başlayacak…")
             except Exception as e:
                 log.error(f"🔴 Scanner hatası: {e}")
