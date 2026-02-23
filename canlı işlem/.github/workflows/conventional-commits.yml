@@ -1,0 +1,80 @@
+name: Conventional Commits Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main, develop]
+
+jobs:
+  check-commits:
+    runs-on: ubuntu-latest
+    name: Validate Commit Messages
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check commit messages
+        uses: wagoid/commitlint-github-action@v5
+        with:
+          configFile: .commitlintrc.json
+        continue-on-error: true
+
+      - name: Validate PR title (for PRs only)
+        if: github.event_name == 'pull_request'
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          echo "Checking PR title: $PR_TITLE"
+          
+          # Pattern: type(scope): subject
+          if [[ $PR_TITLE =~ ^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z-]+\))?:\ .{10,}$ ]]; then
+            echo "✅ PR title format is valid"
+          else
+            echo "❌ PR title format is invalid"
+            echo ""
+            echo "Expected format: <type>(<scope>): <subject>"
+            echo "Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
+            echo ""
+            echo "Examples:"
+            echo "  feat: add new trading strategy"
+            echo "  fix(api): resolve connection timeout"
+            exit 1
+          fi
+
+      - name: Suggest version bump
+        if: github.event_name == 'pull_request'
+        run: |
+          # Get commits in PR
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          
+          COMMITS=$(git log --pretty=format:"%s" $BASE_SHA..$HEAD_SHA)
+          
+          # Analyze commits
+          HAS_BREAKING=false
+          HAS_FEAT=false
+          HAS_FIX=false
+          
+          while IFS= read -r commit; do
+            if [[ $commit =~ BREAKING\ CHANGE ]] || [[ $commit =~ ^[a-z]+(\([a-z-]+\))?!: ]]; then
+              HAS_BREAKING=true
+            elif [[ $commit =~ ^feat ]]; then
+              HAS_FEAT=true
+            elif [[ $commit =~ ^fix ]]; then
+              HAS_FIX=true
+            fi
+          done <<< "$COMMITS"
+          
+          # Suggest version
+          if [ "$HAS_BREAKING" = true ]; then
+            echo "⚠️  **Breaking changes detected** - Suggest MAJOR version bump"
+          elif [ "$HAS_FEAT" = true ]; then
+            echo "✨ **New features detected** - Suggest MINOR version bump"
+          elif [ "$HAS_FIX" = true ]; then
+            echo "🐛 **Bug fixes detected** - Suggest PATCH version bump"
+          else
+            echo "ℹ️  No version bump needed"
+          fi

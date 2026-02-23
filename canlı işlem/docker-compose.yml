@@ -1,0 +1,71 @@
+# ==============================================================================
+# Docker Compose - Pump & Dump Reversion Bot
+# Local development & testing
+# Northflank'da bu dosya kullanılmaz, sadece local test için
+# ==============================================================================
+
+version: '3.8'
+
+services:
+  # Ana bot servisi
+  bot:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: pump-dump-bot
+    restart: unless-stopped
+    environment:
+      # Binance API
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
+      
+      # Demo/Live mode
+      - DEMO_MODE=${DEMO_MODE:-true}
+      
+      # Telegram (optional)
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      
+      # Timezone
+      - TZ=UTC
+      
+    volumes:
+      # Mount logs (optional)
+      - ./logs:/app/logs
+      
+    # Healthcheck
+    healthcheck:
+      test: ["CMD", "python", "-c", "print('OK')"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    
+    # Resource limits (Northflank'da otomatik ayarlanır)
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+  # Redis (opsiyonel - replay mode için)
+  # Northflank'da ayrı addon olarak eklenebilir
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: pump-dump-redis
+  #   restart: unless-stopped
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis_data:/data
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 3
+
+# volumes:
+#   redis_data:

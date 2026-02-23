@@ -1,0 +1,30 @@
+# ==========================================
+# 📦 PUMP & DUMP REVERSION BOT Dependencies
+# ==========================================
+# 18.02.2026.py stratejisi için gerekli kütüphaneler
+
+# Core Trading
+ccxt>=4.0.0
+pandas>=2.0.0
+pandas_ta>=0.3.14b
+numpy>=1.24.0
+
+# HTTP / Async
+aiohttp>=3.9.0
+httpx>=0.27.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# Optional - Infrastructure (Replay mode için)
+redis>=5.0.0
+
+# Optional - API (Gelecekte kullanılabilir)
+fastapi>=0.110.0
+uvicorn>=0.29.0
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+
+# Optional - Backtest görselleştirme
+# matplotlib>=3.8.0
+
