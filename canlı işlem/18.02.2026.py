@@ -218,6 +218,7 @@ class TradeRecord:
     entry_candle_open: float = 0.0  # Giriş mumunun açılış fiyatı
     reentry_count: int = 0          # Bu pump döngüsünde kaçıncı giriş
     consec_green_loss: int = 0      # Zararda arka arkaya yeşil mum sayacı (2'de çık)
+    _last_checked_ts: str = ""       # Son değerlendirilen kapanmış mum timestamp'i (aynı mumu tekrar saymamak için)
 
     # Backtest ekstra alanları
     pump_pct: float = 0.0
@@ -247,7 +248,7 @@ class Config:
     DEFAULT_TYPE        = "future"       # USDT-M futures
     TIMEOUT_MS          = 30_000
     RATE_LIMIT          = True
-    DEMO_MODE           = True           # True → demo.binance.com | False → canlı borsa
+    DEMO_MODE           = os.environ.get("EXCHANGE_SANDBOX", "true").lower() in ("true", "1", "yes")
     MIN_NOTIONAL_USDT   = 5.0            # Binance minimum emir değeri (USDT)
 
     # ── Module 1 — RADAR (Top 10 Rolling Pump - 24H/6×4H) ──────────────
@@ -257,11 +258,11 @@ class Config:
     }
     PUMP_MIN_PCT        = 30.0           # 24H rolling pump (son 6×4H mum) minimum %30
     TOP_N_GAINERS       = 10             # Sadece en yüksek 10 pump watchlist'e alınır
-    SCAN_INTERVAL_SEC   = 600            # Tarama aralığı (10 dk)
+    SCAN_INTERVAL_SEC   = int(os.environ.get("SCAN_INTERVAL_SECONDS", "600"))  # Tarama aralığı (default 10 dk)
     MANAGER_INTERVAL_SEC = 5              # Trade yönetim + sinyal kontrol döngüsü (5 sn)
 
     # ── Module 2 — TRIGGER (Pure Price Action) ───────────────────────
-    TIMEFRAME           = "4h"           # Ana izleme periyodu
+    TIMEFRAME           = os.environ.get("TIMEFRAME", "4h")
     BB_LENGTH           = 20             # Bollinger Band periyodu (TP hesabı için)
     BB_STD              = 2.0            # Bollinger Band standart sapma
     PRE_ENTRY_GREEN_CANDLES = 4          # Giriş mumundan önceki 4 adet 4H mum hepsi yeşil + kümülatif >= %30 olmalı
@@ -278,8 +279,8 @@ class Config:
     MIN_VOLUME_USDT     = 10_000_000.0   # Pump penceresindeki (6 mum) toplam hacim min 10M USDT olmalı
 
     # ── Module 3 — TRADE MANAGEMENT ─────────────────────────────────
-    LEVERAGE            = 3              # Sabit 3x kaldıraç (asla değişmez)
-    MAX_ACTIVE_TRADES   = 5              # Aynı anda en fazla 5 işlem
+    LEVERAGE            = int(os.environ.get("LEVERAGE", "3"))
+    MAX_ACTIVE_TRADES   = int(os.environ.get("MAX_ACTIVE_TRADES", "5"))
     RISK_PER_TRADE_PCT  = 2.0            # SL vurulursa equity'nin %2'si kaybedilir
     SL_ABOVE_ENTRY_PCT  = 15.0           # SL: Giriş fiyatının TAM %15 üstü (entry × 1.15)
     BREAKEVEN_DROP_PCT  = 7.0            # Stage 1: %7 düşüşte SL → entry (breakeven)
@@ -928,7 +929,13 @@ class PumpSnifferBot:
                     continue
 
                 # ── Stage 4: Zararda yeşil mum → SHORT kapat ───────────────────
-                if curr["close"] > curr["open"] and curr["close"] > trade.entry_price:
+                # Aynı kapanmış mumu tekrar saymamak için timestamp kontrolü
+                candle_ts = str(df.index[-1])
+                if candle_ts == trade._last_checked_ts:
+                    # Bu mum zaten değerlendirildi — tekrar sayma
+                    pass
+                elif curr["close"] > curr["open"] and curr["close"] > trade.entry_price:
+                    trade._last_checked_ts = candle_ts
                     green_body_pct = (curr["close"] - curr["open"]) / curr["open"] * 100.0
                     # Zararda tek yeşil mum gövdesi >= %10 → anında kapat (reversal olmadı)
                     if green_body_pct >= Config.GREEN_LOSS_SINGLE_BODY_PCT:
@@ -978,6 +985,7 @@ class PumpSnifferBot:
                             pass
                         continue
                 else:
+                    trade._last_checked_ts = candle_ts
                     trade.consec_green_loss = 0  # Kırmızı veya kârda yeşil → sayacı sıfırla
 
             except Exception as e:
