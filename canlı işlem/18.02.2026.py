@@ -1204,19 +1204,20 @@ class PumpSnifferBot:
         """
         GÖREV 1 — HAZIRLIK RADARI: Universe taraması + watchlist doldurma.
 
-        ÇALIŞMA ZAMANI: Her 4H mum kapanışından TAM 5 DAKİKA ÖNCE çalışır.
-          → 23:55, 03:55, 07:55, 11:55, 15:55, 19:55 UTC
+        ÇALIŞMA ZAMANI: Her 4H mum kapanışından TAM 10 DAKİKA ÖNCE çalışır.
+          → 23:50, 03:50, 07:50, 11:50, 15:50, 19:50 UTC
 
         MANTIK:
           1. Sonraki 4H kapanışa kalan süreyi hesapla.
-          2. Kapanışa 5 dakika kalana kadar uyu.
+          2. Kapanışa 10 dakika kalana kadar uyu.
           3. scan_universe() çalıştır → watchlist hazırla.
           4. Orphan algo emirleri temizle.
           5. Kapanış saatini geç → sonraki döngüye devam.
 
         Böylece trigger_loop 4H kapanışında uyanınca watchlist HAZIR olur.
+        10 dakika ~300 coin taramak için yeterli süre sağlar.
         """
-        PREP_OFFSET_SEC = 5 * 60  # Kapanıştan 5 dakika önce
+        PREP_OFFSET_SEC = 10 * 60  # Kapanıştan 10 dakika önce
 
         while self.running:
             try:
@@ -1224,7 +1225,7 @@ class PumpSnifferBot:
                 prep_wait = secs_to_close - PREP_OFFSET_SEC
 
                 if prep_wait > 0:
-                    # Henüz prep penceresine girmedik → kapanışa 5dk kalana kadar uyu
+                    # Henüz prep penceresine girmedik → kapanışa 10dk kalana kadar uyu
                     wake_time = datetime.now(timezone.utc) + timedelta(seconds=prep_wait)
                     log.info(f"⏳ [PREP] Sonraki tarama {wake_time.strftime('%H:%M:%S')} UTC'de "
                              f"({prep_wait:.0f}s sonra)")
@@ -1232,7 +1233,7 @@ class PumpSnifferBot:
                 # else: Zaten prep penceresi içindeyiz → hemen tara
 
                 close_dt = self._next_4h_close_utc()
-                log.info(f"🔍 [PREP] {close_dt.strftime('%H:%M')} kapanışına 5dk kala — "
+                log.info(f"🔍 [PREP] {close_dt.strftime('%H:%M')} kapanışına 10dk kala — "
                          f"Universe taraması başlıyor…")
 
                 # Yeni Event oluştur — bu döngünün trigger'ı bunu bekleyecek
@@ -1279,11 +1280,11 @@ class PumpSnifferBot:
         GÖREV 2 — KESKİN NİŞANCI GİRİŞİ: Watchlist'teki coinlerin son KAPANMIŞ
         mumunu kontrol eder, koşullar uygunsa SHORT açar.
 
-        ÇALIŞMA ZAMANI: Her 4H mum kapanışından TAM 1 SANİYE SONRA çalışır.
-          → 00:00:01, 04:00:01, 08:00:01, 12:00:01, 16:00:01, 20:00:01 UTC
+        ÇALIŞMA ZAMANI: Her 4H mum kapanışından TAM 2 SANİYE SONRA çalışır.
+          → 00:00:02, 04:00:02, 08:00:02, 12:00:02, 16:00:02, 20:00:02 UTC
 
         MANTIK:
-          1. Sonraki 4H kapanışa kalan süre + 1 saniye bekle.
+          1. Sonraki 4H kapanışa kalan süre + 2 saniye bekle.
           2. Watchlist'teki coinlerin OHLCV'sini çek (limit=3 yeterli).
           3. Canlı mumu at → KAPANMIŞ son mumu al (iloc[-1] after _remove_live_candle).
           4. check_entry_signal → kırmızı mum kontrolü.
@@ -1292,7 +1293,7 @@ class PumpSnifferBot:
 
         NOT: _processed_signals (Tek Kurşun kilidi) kullanılmaya devam eder.
         """
-        TRIGGER_OFFSET_SEC = 3  # Kapanıştan 3 saniye sonra
+        TRIGGER_OFFSET_SEC = 2  # Kapanıştan 2 saniye sonra
 
         while self.running:
             try:
@@ -1430,27 +1431,27 @@ class PumpSnifferBot:
 
         Üç bağımsız asenkron görev eşzamanlı başlatılır:
 
-          GÖREV 1 • prep_scan_loop  : 4H kapanıştan 5dk ÖNCE → Universe taraması
-          GÖREV 2 • trigger_loop    : 4H kapanıştan 1sn SONRA → Sinyal kontrolü + SHORT
+          GÖREV 1 • prep_scan_loop  : 4H kapanıştan 10dk ÖNCE → Universe taraması
+          GÖREV 2 • trigger_loop    : 4H kapanıştan 2sn SONRA → Sinyal kontrolü + SHORT
           GÖREV 3 • manager_loop    : Her 5 saniye → Açık trade yönetimi (TSL/BE/SL)
 
         Zamanlama örneği (08:00 UTC kapanışı):
-          07:55:00 → PREP taraması başlar, watchlist dolar
-          08:00:01 → TRIGGER uyanır, kapanmış mumu kontrol eder, SHORT açar
+          07:50:00 → PREP taraması başlar, watchlist dolar
+          08:00:02 → TRIGGER uyanır, kapanmış mumu kontrol eder, SHORT açar
           Sürekli  → MANAGER 5s aralıkla açık işlemleri izler
         """
         self.running = True
         next_close = self._next_4h_close_utc()
-        prep_time  = next_close - timedelta(minutes=5)
+        prep_time  = next_close - timedelta(minutes=10)
         log.info("=" * 75)
-        log.info("  PUMP & DUMP REVERSION BOT v3.9 — ZAMAN AYARLI 4H MİMARİSİ")
+        log.info("  PUMP & DUMP REVERSION BOT v3.9.4 — ZAMAN AYARLI 4H MİMARİSİ")
         log.info(f"  Kaldıraç: x{Config.LEVERAGE}  |  "
                  f"Top {Config.TOP_N_GAINERS} Gainer  |  "
                  f"Risk/trade: %{Config.RISK_PER_TRADE_PCT}")
         log.info(f"  ⏰ Sonraki 4H kapanış: {next_close.strftime('%H:%M')} UTC  |  "
                  f"Prep: {prep_time.strftime('%H:%M')} UTC")
-        log.info(f"  📡 PREP: kapanışa -5dk  |  "
-                 f"🎯 TRIGGER: kapanışa +1sn  |  "
+        log.info(f"  📡 PREP: kapanışa -10dk  |  "
+                 f"🎯 TRIGGER: kapanışa +2sn  |  "
                  f"⚡ MANAGER: {Config.MANAGER_INTERVAL_SEC}s")
         log.info("=" * 75)
 
