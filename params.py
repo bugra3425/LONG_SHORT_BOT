@@ -19,7 +19,7 @@
 #  BÖLÜM 1 — ZAMAN DİLİMİ
 # ──────────────────────────────────────────────────────────────────────
 
-TIMEFRAME = "4h"
+TIMEFRAME = "15m"
 # Desteklenen değerler: "15m" | "30m" | "1h" | "2h" | "4h"
 # ⚠ Backtest'te hızlı test: "1h" ile 4× daha fazla bar → 4× daha fazla sinyal
 # ⚠ Canlı botta: piyasa kapanış mumunu bekler (4h = 4 saatte 1 bar)
@@ -28,20 +28,20 @@ TIMEFRAME = "4h"
 #  BÖLÜM 2 — PUMP TESPİT KOŞULLARİ (Module 1 — Radar)
 # ──────────────────────────────────────────────────────────────────────
 
-PUMP_MIN_PCT = 30.0
+PUMP_MIN_PCT = 20.0
 # Pump penceresi boyunca minimum kazanç yüzdesi (window[0].low → son kapanış)
 # Örnek: 30 → son 6 mumda dip'ten kapanışa %30+ çıkış olmalı
 # Daha az sinyal istiyorsan artır (35, 40), fazla sinyal istiyorsan düşür (20, 25)
 
-PUMP_WINDOW_CANDLES = 6
+PUMP_WINDOW_CANDLES = 4
 # Kaç mumun geçmişine bakılır? (4h × 6 = 24 saat)
 # Kısa TF kullanıyorsan da 6 bırakabilirsin (1h × 6 = 6 saat pencere)
 
-PUMP_MIN_GREEN_COUNT = 4
+PUMP_MIN_GREEN_COUNT = 2
 # 6 mumun kaçı yeşil olmalı? (min 4 → steady climb)
 # Agresif test için 3'e indirebilirsin
 
-PUMP_CANDLE_BODY_MIN_PCT = 5.0
+PUMP_CANDLE_BODY_MIN_PCT = 3.0
 # Yeşil mum gövdesi minimum yüzdesi (cılız fitilli mumları eliyor)
 # Önerilen aralık: 3.0 – 8.0
 
@@ -56,7 +56,7 @@ MIN_VOLUME_USDT = 10_000_000.0
 #  BÖLÜM 3 — GİRİŞ TETİKLEYİCİ KOŞULLARİ (Module 2 — Trigger)
 # ──────────────────────────────────────────────────────────────────────
 
-ENTRY_RED_BODY_MIN_PCT = 4.0
+ENTRY_RED_BODY_MIN_PCT = 2.0
 # Giriş mumunun kırmızı gövdesi minimum yüzdesi
 # SHORT girilecek mum güçlü bir kırmızı mum olmalı (zayıf doji girilmez)
 
@@ -109,7 +109,7 @@ RISK_PER_TRADE_PCT = 2.0
 #  BÖLÜM 6 — TARAMA ARALIKLARI (Canlı Bot)
 # ──────────────────────────────────────────────────────────────────────
 
-SCAN_INTERVAL_SEC = 600
+SCAN_INTERVAL_SEC = 300
 # Universe tarama aralığı (saniye). Kaç saniyede bir tüm Binance futures taranır?
 
 WATCHLIST_CHECK_INTERVAL_SEC = 60

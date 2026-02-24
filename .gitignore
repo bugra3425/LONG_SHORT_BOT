@@ -63,6 +63,7 @@ backtest_data/
 recovery/
 backup/
 *.bak
+orjinal değerler.py
 
 # OS Files
 Thumbs.db
