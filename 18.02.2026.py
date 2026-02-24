@@ -67,6 +67,24 @@ logging.basicConfig(
 
 log = logging.getLogger("PumpDumpBot")
 
+def _load_params():
+    import importlib.util
+    _path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "params.py")
+    if not os.path.exists(_path):
+        log.warning("⚠️  params.py bulunamadı — Config varsayılan değerleri kullanılıyor")
+        return None
+    spec = importlib.util.spec_from_file_location("params", _path)
+    mod  = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+_P = _load_params()
+
+def _p(name, default):
+    """params.py'de tanımlıysa kullan, yoksa default döndür."""
+    return getattr(_P, name, default) if _P is not None else default
+
+
 # ── Demo / Canlı Exchange Factory ─────────────────────────────────────────────────────
 def _make_binance_exchange(extra_opts: dict = None, demo: bool = False) -> ccxt.binance:
     """
@@ -256,53 +274,47 @@ class Config:
         # Major-cap coinleri hariç tut
         "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE",
     }
-    PUMP_MIN_PCT        = 30.0           # 24H rolling pump (son 6×4H mum) minimum %30
-    TOP_N_GAINERS       = 10             # Sadece en yüksek 10 pump watchlist'e alınır
-    SCAN_INTERVAL_SEC   = int(os.environ.get("SCAN_INTERVAL_SECONDS", "600"))  # Universe tarama aralığı (default 10 dk)
-    MANAGER_INTERVAL_SEC = 5              # Trade yönetim döngüsü - SADECE açık trade'ler (5 sn)
-    WATCHLIST_CHECK_INTERVAL_SEC = int(os.environ.get("WATCHLIST_CHECK_SECONDS", "60"))  # Watchlist sinyal kontrolü (60 sn)
+    PUMP_MIN_PCT                 = _p("PUMP_MIN_PCT",                30.0)
+    TOP_N_GAINERS                = _p("TOP_N_GAINERS",               10)
+    SCAN_INTERVAL_SEC            = _p("SCAN_INTERVAL_SEC",           int(os.environ.get("SCAN_INTERVAL_SECONDS", "600")))
+    MANAGER_INTERVAL_SEC         = _p("MANAGER_INTERVAL_SEC",        5)
+    WATCHLIST_CHECK_INTERVAL_SEC = _p("WATCHLIST_CHECK_INTERVAL_SEC", int(os.environ.get("WATCHLIST_CHECK_SECONDS", "60")))
 
     # ── Module 2 — TRIGGER (Pure Price Action) ───────────────────────
-    TIMEFRAME           = os.environ.get("TIMEFRAME", "4h")
-    BB_LENGTH           = 20             # Bollinger Band periyodu (TP hesabı için)
-    BB_STD              = 2.0            # Bollinger Band standart sapma
-    PRE_ENTRY_GREEN_CANDLES = 4          # Giriş mumundan önceki 4 adet 4H mum hepsi yeşil + kümülatif >= %30 olmalı
-    PUMP_CONSECUTIVE_GREEN = 4           # Kusursuz 4 Yeşil Rallisi: T-4,T-3,T-2,T-1 hepsi yeşil
-    PUMP_WINDOW_CANDLES = 6              # Rolling pencere: son 6 adet 4H mum (24 saat)
-    #   rolling_high, rolling_low hesap → net kazanç >= %30 VE high, low'dan SONRA gelmiş olmalı
-    PUMP_CANDLE_BODY_MIN_PCT = 5.0       # Yeşil mum gövdesi min %5 olmalı (cılız mum sayılmaz)
-    PUMP_MIN_GREEN_COUNT = 4             # 6 mumun en az 4’ü yeşil olmalı (steady climb)
-    ENTRY_RED_BODY_MIN_PCT = 4.0         # Giriş kırmızı mumun gövdesi min %4 olmalı (solid reversal)
-    PRE_CANDLE_GREEN_BODY_MAX_PCT = 30.0  # Giriş öncesi yeşil mumun gövdesi max %30 (sahte kırmızı filtresi)
-    GREEN_LOSS_MIN_BODY_PCT = 6.0        # Kullanılmıyor (gerçe dönük uyumluluk)
-    GREEN_LOSS_SINGLE_BODY_PCT = 10.0    # Zararda tek yeşil mum gövdesi >= %10 → anında çık (reversal olmadı sinyali)
-    ANTI_ROCKET_SINGLE_CANDLE_PCT = 30.0  # Tetikleyiciden önceki mum tek başına >= %30 çıktıysa giriş yok (boğa bayrağı)
-    MIN_VOLUME_USDT     = 10_000_000.0   # Pump penceresindeki (6 mum) toplam hacim min 10M USDT olmalı
+    TIMEFRAME                    = _p("TIMEFRAME",                   os.environ.get("TIMEFRAME", "4h"))
+    BB_LENGTH                    = 20
+    BB_STD                       = 2.0
+    PRE_ENTRY_GREEN_CANDLES      = 4
+    PUMP_CONSECUTIVE_GREEN       = 4
+    PUMP_WINDOW_CANDLES          = _p("PUMP_WINDOW_CANDLES",         6)
+    PUMP_CANDLE_BODY_MIN_PCT     = _p("PUMP_CANDLE_BODY_MIN_PCT",    5.0)
+    PUMP_MIN_GREEN_COUNT         = _p("PUMP_MIN_GREEN_COUNT",        4)
+    ENTRY_RED_BODY_MIN_PCT       = _p("ENTRY_RED_BODY_MIN_PCT",      4.0)
+    PRE_CANDLE_GREEN_BODY_MAX_PCT = _p("PRE_CANDLE_GREEN_BODY_MAX_PCT", 30.0)
+    GREEN_LOSS_MIN_BODY_PCT      = _p("GREEN_LOSS_MIN_BODY_PCT",     6.0)
+    GREEN_LOSS_SINGLE_BODY_PCT   = _p("GREEN_LOSS_SINGLE_BODY_PCT",  10.0)
+    ANTI_ROCKET_SINGLE_CANDLE_PCT = _p("ANTI_ROCKET_SINGLE_CANDLE_PCT", 30.0)
+    MIN_VOLUME_USDT              = _p("MIN_VOLUME_USDT",             10_000_000.0)
 
     # ── Module 3 — TRADE MANAGEMENT ─────────────────────────────────
-    LEVERAGE            = int(os.environ.get("LEVERAGE", "3"))
-    MAX_ACTIVE_TRADES   = int(os.environ.get("MAX_ACTIVE_TRADES", "5"))
-    RISK_PER_TRADE_PCT  = 2.0            # SL vurulursa equity'nin %2'si kaybedilir
-    SL_ABOVE_ENTRY_PCT  = 15.0           # SL: Giriş fiyatının TAM %15 üstü (entry × 1.15)
-    BREAKEVEN_DROP_PCT  = 7.0            # Stage 1: %7 düşüşte SL → entry (breakeven)
-    TSL_ACTIVATION_DROP_PCT = 7.0        # Stage 2: %7 düşüşte Trailing Stop aktif
-    TSL_TRAIL_PCT       = 4.0            # TSL mesafesi: SL = lowest_low × 1.04
-    #   Örnek: entry=1.00, lowest_low=0.80 → SL=0.832 (en az +%48 ROI garanti)
+    LEVERAGE                     = _p("LEVERAGE",                    int(os.environ.get("LEVERAGE", "3")))
+    MAX_ACTIVE_TRADES            = _p("MAX_ACTIVE_TRADES",           int(os.environ.get("MAX_ACTIVE_TRADES", "5")))
+    RISK_PER_TRADE_PCT           = _p("RISK_PER_TRADE_PCT",          2.0)
+    SL_ABOVE_ENTRY_PCT           = _p("SL_ABOVE_ENTRY_PCT",          15.0)
+    BREAKEVEN_DROP_PCT           = _p("BREAKEVEN_DROP_PCT",          7.0)
+    TSL_ACTIVATION_DROP_PCT      = _p("TSL_ACTIVATION_DROP_PCT",     7.0)
+    TSL_TRAIL_PCT                = _p("TSL_TRAIL_PCT",               4.0)
 
     # ── Module 4 — Çıkış yalnızca SL / BE / TSL ile ─────────────────
-    #   True Engulfing kaldırıldı — çıkış yalnızca SL/TSL tetiklenmesiyle
-
     # ── Module 5 — RE-ENTRY (Fresh Pump Koşulu) ─────────────────────
-    #   24h cooldown kaldırıldı — yeniden giriş şartı:
-    #   çıkış sonrası fiyat çıkış seviyesini aşmalı (yeni push) + kırmızı 4H mum
 
     # ── Backtest ──────────────────────────────────────────────────────
-    BACKTEST_DAYS            = 31        # Son 31 gün
-    BACKTEST_INITIAL_CAPITAL = 1000.0    # Başlangıç sermayesi (USDT)
-    BACKTEST_SYMBOLS    = [
+    BACKTEST_DAYS            = _p("BACKTEST_DAYS",            31)
+    BACKTEST_INITIAL_CAPITAL = _p("BACKTEST_INITIAL_CAPITAL", 1000.0)
+    BACKTEST_SYMBOLS         = _p("BACKTEST_SYMBOLS", [
         "TRB/USDT", "GAS/USDT", "CYBER/USDT", "LOOM/USDT",
         "YGG/USDT", "VANRY/USDT", "ORDI/USDT", "BIGTIME/USDT",
-    ]
+    ])
 
 
 # ══════════════════════════════════════════════════════════════════════════
