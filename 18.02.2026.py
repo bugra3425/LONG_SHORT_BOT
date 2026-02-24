@@ -557,16 +557,22 @@ class PumpSnifferBot:
         all_pumps.sort(key=lambda x: x.pump_pct, reverse=True)
         top_n = all_pumps[:Config.TOP_N_GAINERS]
 
-        # Watchlist güncelle — aktif trade olanları koru
+        # Watchlist güncelle — aktif trade olanlar DA dahil (reentry destekli)
         new_watchlist: Dict[str, WatchlistItem] = {}
         for item in top_n:
-            if item.symbol not in self.active_trades:
-                new_watchlist[item.symbol] = item
-                log.info(
-                    f"  🚨 TOP GAINER: {item.symbol}  |  "
-                    f"+{item.pump_pct:.1f}%  |  "
-                    f"Zirve: {item.pump_high:.6f}"
-                )
+            new_watchlist[item.symbol] = item
+            tag = "(TRADE AÇİK)" if item.symbol in self.active_trades else ""
+            log.info(
+                f"  🚨 TOP GAINER: {item.symbol}  |  "
+                f"+{item.pump_pct:.1f}%  |  "
+                f"Zirve: {item.pump_high:.6f}  {tag}"
+            )
+        # Eski watchlist'teki coinleri koru — scan arasında watchlist boşalıp
+        # reentry fırsatını kaçırmamak için
+        for sym, item in self.watchlist.items():
+            if sym not in new_watchlist:
+                new_watchlist[sym] = item
+                log.info(f"  📌 KORUNAN: {sym} (önceki scan'den)")
         self.watchlist = new_watchlist
         log.info(f"📋 Aktif Watchlist (Top {Config.TOP_N_GAINERS}): {len(self.watchlist)} coin")
 
@@ -863,6 +869,8 @@ class PumpSnifferBot:
         """
         Binance'teki mevcut STOP_MARKET emrini iptal edip yeni fiyattan tekrar oluşturur.
         BE / TSL tetiklendiğinde çağrılır — SL sadece RAM'de değil, borsada da güncellenir.
+
+        v3.8: -4130 hatası için retry mekanizması eklendi.
         """
         try:
             await self._safe_call(self.exchange.load_markets)
@@ -870,20 +878,40 @@ class PumpSnifferBot:
             price_prec = get_digits(market.get("precision", {}).get("price"))
             sl_rounded = round(new_sl_price, price_prec)
 
-            # Eski stop emrini sil
-            await self._cancel_algo_orders(symbol)
+            # 1) Eski stop emrini sil
+            await self._cancel_algo_orders(symbol, retry=True)
+            await asyncio.sleep(0.2)  # Binance senkronizasyon bekleme
 
-            # Yeni stop emrini koy
-            await self._safe_call(
-                self.exchange.create_order,
-                symbol, "stop_market", "buy", None,
-                params={
-                    "stopPrice"    : sl_rounded,
-                    "closePosition": True,
-                    "workingType"  : "MARK_PRICE",
-                }
-            )
-            log.info(f"  🔄 SL GÜNCELLENDI (Binance): {symbol}  → {sl_rounded:.{price_prec}f}")
+            # 2) Yeni stop emrini koy
+            try:
+                await self._safe_call(
+                    self.exchange.create_order,
+                    symbol, "stop_market", "buy", None,
+                    params={
+                        "stopPrice"    : sl_rounded,
+                        "closePosition": True,
+                        "workingType"  : "MARK_PRICE",
+                    }
+                )
+                log.info(f"  🔄 SL GÜNCELLENDI (Binance): {symbol}  → {sl_rounded:.{price_prec}f}")
+            except ccxt.ExchangeError as e:
+                if "-4130" in str(e):
+                    # -4130: Orphan stop hala duruyor — force temizle ve tekrar dene
+                    log.warning(f"  ⚠️ -4130 yakalandı, orphan cleanup + retry: {symbol}")
+                    await self._cancel_algo_orders(symbol, retry=True)
+                    await asyncio.sleep(0.3)
+                    await self._safe_call(
+                        self.exchange.create_order,
+                        symbol, "stop_market", "buy", None,
+                        params={
+                            "stopPrice"    : sl_rounded,
+                            "closePosition": True,
+                            "workingType"  : "MARK_PRICE",
+                        }
+                    )
+                    log.info(f"  🔄 SL GÜNCELLENDI (retry sonrası): {symbol}  → {sl_rounded:.{price_prec}f}")
+                else:
+                    raise
         except Exception as e:
             log.error(f"  ❌ Binance SL güncelleme hatası ({symbol}): {e}")
 
@@ -931,29 +959,67 @@ class PumpSnifferBot:
         """
         The Shadow Tracker — 3 Aşamalı Dinamik Stop-Loss Yönetimi.
 
+        v3.8 FIX: CANLI MUM ODAKLI — Giriş mumunun geçmiş fitillerine aldanma
+        (Phantom Stop) hatası düzeltildi.
+
         Stage 1 — Breakeven  : %7 düşüşte SL = entry (sıfır kaybı garantile)
                   → Binance'teki fiziksel stop emri güncellenir
         Stage 2 — TSL Aktif  : %7 düşüşte Trailing Stop devreye girer
                   → Her SL değişiminde Binance'teki stop emri güncellenir
         Stage 3 — SL Kontrol : bar close >= SL → fiziksel market close
-        Stage 4 — Zararda yeşil mum → fiziksel market close
+        Stage 4 — Zararda yeşil mum → fiziksel market close (sadece KAPANMIŞ mumlar)
+
+        ÖNEMLİ: Stage 1-3 CANLI MUMU kullanır (iloc[-1]).
+                 Stage 4 (Yeşil mum çıkışları) KAPANMIŞ mumu kullanır (canlı mum atılır).
         """
         closed = []
 
         for sym, trade in self.active_trades.items():
             try:
-                df = await self.fetch_ohlcv(sym, Config.TIMEFRAME,
+                df_raw = await self.fetch_ohlcv(sym, Config.TIMEFRAME,
                                             limit=Config.BB_LENGTH + 5)
-                df = self._remove_live_candle(df, Config.TIMEFRAME)  # ✅ Canlı mumu doğru şekilde tespit et ve at
-                if df.empty:
+                if df_raw.empty:
                     continue
 
-                curr = df.iloc[-1]
+                # ── CANLI MUM: BE / TSL / SL kontrolü için ────────────────────
+                # ASLA _remove_live_candle kullanma! Açık işlemler CANLI fiyata göre yönetilir.
+                live = df_raw.iloc[-1]
+
+                # ── GİRİŞ MUMU KORUMASI (Phantom Stop Fix) ────────────────────
+                # Eğer canlı mum, giriş mumunun AYNI periyodundaysa (yani bot giriş
+                # mumunu "live" olarak görüyorsa), o mumun geçmiş fitilleri (wick)
+                # TSL/BE hesaplarını bozar → bu iterasyonu ATLA.
+                # Giriş mumunun saat bilgisi trade.entry_time'da saklanır.
+                try:
+                    entry_dt = pd.Timestamp(trade.entry_time)
+                    live_candle_start = df_raw.index[-1]
+                    # Timeframe süresini hesapla
+                    tf_str = Config.TIMEFRAME.lower()
+                    if 'h' in tf_str:
+                        tf_delta = timedelta(hours=int(tf_str.replace('h', '')))
+                    elif 'm' in tf_str:
+                        tf_delta = timedelta(minutes=int(tf_str.replace('m', '')))
+                    elif 'd' in tf_str:
+                        tf_delta = timedelta(days=int(tf_str.replace('d', '')))
+                    else:
+                        tf_delta = timedelta(hours=4)
+
+                    # Giriş zamanı bu mumun periyodunda mı? (start <= entry < start + tf)
+                    live_candle_end = live_candle_start + tf_delta
+                    if live_candle_start <= entry_dt < live_candle_end:
+                        # Giriş mumunun içindeyiz — BE/TSL/SL kontrolü ATLA
+                        # Binance'teki ilk SL zaten koyuldu, bir sonraki mumu bekle
+                        log.debug(f"  ⏭️ {sym}: Giriş mumunun içindeyiz, BE/TSL/SL değerlendirmesi atlanıyor")
+                        continue
+                except Exception:
+                    pass  # entry_time parse edilemezse güvenli şekilde devam et
+
                 old_sl = trade.stop_loss  # SL değişimini takip etmek için
 
                 # ── Stage 1: Breakeven — %7 düşüşte SL = entry ────────────────
+                # CANLI mumun close'u (anlık fiyat) kullanılır
                 if not trade.breakeven_triggered:
-                    price_drop_pct = (trade.entry_price - curr["close"]) / trade.entry_price * 100.0
+                    price_drop_pct = (trade.entry_price - live["close"]) / trade.entry_price * 100.0
                     if price_drop_pct >= Config.BREAKEVEN_DROP_PCT:
                         trade.stop_loss = trade.entry_price
                         trade.breakeven_triggered = True
@@ -967,11 +1033,12 @@ class PumpSnifferBot:
                             pass
 
                 # ── Stage 2: TSL — %7 düşüşte aktif, SL = lowest_low × 1.04 ──
-                bar_drop_pct = (trade.entry_price - curr["low"]) / trade.entry_price * 100.0
+                # CANLI mumun low'u kullanılır (anlık en düşük)
+                bar_drop_pct = (trade.entry_price - live["low"]) / trade.entry_price * 100.0
                 if not trade.tsl_active:
                     if bar_drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
                         trade.tsl_active = True
-                        trade.lowest_low_reached = curr["low"]
+                        trade.lowest_low_reached = live["low"]
                         new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
                         trade.stop_loss = min(trade.stop_loss, new_sl)
                         log.info(f"  🎯 TSL AKTİF: {sym}  Düşüş: %{bar_drop_pct:.1f}  "
@@ -982,8 +1049,8 @@ class PumpSnifferBot:
                         except Exception:
                             pass
                 else:
-                    if curr["low"] < trade.lowest_low_reached:
-                        trade.lowest_low_reached = curr["low"]
+                    if live["low"] < trade.lowest_low_reached:
+                        trade.lowest_low_reached = live["low"]
                         new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
                         trade.stop_loss = min(trade.stop_loss, new_sl)
                         log.info(f"  📉 TSL GÜNCELLE: {sym}  "
@@ -994,9 +1061,9 @@ class PumpSnifferBot:
                     await self._update_binance_sl(sym, trade.stop_loss)
 
                 # ── Stage 3: SL Kontrol (CLOSE-BASED) ─────────────────────────
-                # Mum içi iğneleri (HIGH) yoksay — sadece kapanış fiyatı SL'yi aşarsa çık
-                if curr["close"] >= trade.stop_loss:
-                    exit_p  = curr["close"]
+                # CANLI mumun close'u (anlık fiyat) SL'yi aşarsa çık
+                if live["close"] >= trade.stop_loss:
+                    exit_p  = live["close"]
                     pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
                     pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
                     reason  = "TSL-HIT" if trade.tsl_active else "STOP-LOSS"
@@ -1023,17 +1090,24 @@ class PumpSnifferBot:
                     continue
 
                 # ── Stage 4: Zararda yeşil mum → SHORT kapat ───────────────────
+                # SADECE KAPANMIŞ mumlar değerlendirilir (canlı mum henüz kapanmadı).
+                # Canlı mumu atarak kapanmış son mumu al.
+                df_closed = self._remove_live_candle(df_raw, Config.TIMEFRAME)
+                if df_closed.empty:
+                    continue
+                closed_candle = df_closed.iloc[-1]
+
                 # Aynı kapanmış mumu tekrar saymamak için timestamp kontrolü
-                candle_ts = str(df.index[-1])
+                candle_ts = str(df_closed.index[-1])
                 if candle_ts == trade._last_checked_ts:
                     # Bu mum zaten değerlendirildi — tekrar sayma
                     pass
-                elif curr["close"] > curr["open"] and curr["close"] > trade.entry_price:
+                elif closed_candle["close"] > closed_candle["open"] and closed_candle["close"] > trade.entry_price:
                     trade._last_checked_ts = candle_ts
-                    green_body_pct = (curr["close"] - curr["open"]) / curr["open"] * 100.0
+                    green_body_pct = (closed_candle["close"] - closed_candle["open"]) / closed_candle["open"] * 100.0
                     # Zararda tek yeşil mum gövdesi >= %10 → anında kapat (reversal olmadı)
                     if green_body_pct >= Config.GREEN_LOSS_SINGLE_BODY_PCT:
-                        exit_p  = curr["close"]
+                        exit_p  = closed_candle["close"]
                         pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
                         pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
                         trade.exit_time   = datetime.now(timezone.utc).isoformat()
@@ -1060,7 +1134,7 @@ class PumpSnifferBot:
                     # Küçük zararda yeşil → sayacı artır, 2'de kapat
                     trade.consec_green_loss += 1
                     if trade.consec_green_loss >= 2:
-                        exit_p  = curr["close"]
+                        exit_p  = closed_candle["close"]
                         pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
                         pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
                         trade.exit_time   = datetime.now(timezone.utc).isoformat()
@@ -1095,76 +1169,143 @@ class PumpSnifferBot:
             del self.active_trades[sym]
 
     # ─────────────────────────────────────────────────────────────────
-    # 2.4  ANA DÖNGÜ
+    # 2.4  ZAMAN AYARLI 4H MİMARİSİ  (v3.9)
+    #      3 Asenkron Görev: Prep-Scan + Trigger + Manager
     # ─────────────────────────────────────────────────────────────────
 
-    # ─────────────────────────────────────────────────────────────────
-    # 2.4  TRI-LOOP MİMARİSİ  (Scanner + Manager + Watchlist paralel)
-    # ─────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _seconds_until_next_4h() -> float:
+        """
+        Sonraki 4H mum kapanış zamanına (00/04/08/12/16/20 UTC) kalan saniyeyi döndürür.
+        Binance 4H mumları şu UTC saatlerinde kapanır: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00.
+        """
+        now = datetime.now(timezone.utc)
+        current_hour = now.hour
+        next_4h_hour = (current_hour // 4 + 1) * 4
+        if next_4h_hour >= 24:
+            next_dt = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        else:
+            next_dt = now.replace(hour=next_4h_hour, minute=0, second=0, microsecond=0)
+        return max((next_dt - now).total_seconds(), 0)
 
-    async def _scanner_loop(self):
+    @staticmethod
+    def _next_4h_close_utc() -> datetime:
+        """Sonraki 4H kapanış zamanını datetime olarak döndürür."""
+        now = datetime.now(timezone.utc)
+        current_hour = now.hour
+        next_4h_hour = (current_hour // 4 + 1) * 4
+        if next_4h_hour >= 24:
+            return now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        return now.replace(hour=next_4h_hour, minute=0, second=0, microsecond=0)
+
+    # ── GÖREV 1: PREP_SCAN_LOOP (Hazırlık Radarı) ────────────────────
+
+    async def _prep_scan_loop(self):
         """
-        DÖNGÜ 1 — SCANNER: Universe'ü tarar, watchlist günceller.
-        Bu döngü ağır API çağrıları yapar (yüzlerce coin), SCAN_INTERVAL_SEC (600s) aralıkla.
-        
-        v3.7: Scan sonrası orphan algo temizleyici (watchlist'te olup trade'i olmayan coinler)
+        GÖREV 1 — HAZIRLIK RADARI: Universe taraması + watchlist doldurma.
+
+        ÇALIŞMA ZAMANI: Her 4H mum kapanışından TAM 5 DAKİKA ÖNCE çalışır.
+          → 23:55, 03:55, 07:55, 11:55, 15:55, 19:55 UTC
+
+        MANTIK:
+          1. Sonraki 4H kapanışa kalan süreyi hesapla.
+          2. Kapanışa 5 dakika kalana kadar uyu.
+          3. scan_universe() çalıştır → watchlist hazırla.
+          4. Orphan algo emirleri temizle.
+          5. Kapanış saatini geç → sonraki döngüye devam.
+
+        Böylece trigger_loop 4H kapanışında uyanınca watchlist HAZIR olur.
         """
+        PREP_OFFSET_SEC = 5 * 60  # Kapanıştan 5 dakika önce
+
         while self.running:
             try:
+                secs_to_close = self._seconds_until_next_4h()
+                prep_wait = secs_to_close - PREP_OFFSET_SEC
+
+                if prep_wait > 0:
+                    # Henüz prep penceresine girmedik → kapanışa 5dk kalana kadar uyu
+                    wake_time = datetime.now(timezone.utc) + timedelta(seconds=prep_wait)
+                    log.info(f"⏳ [PREP] Sonraki tarama {wake_time.strftime('%H:%M:%S')} UTC'de "
+                             f"({prep_wait:.0f}s sonra)")
+                    await asyncio.sleep(prep_wait)
+                # else: Zaten prep penceresi içindeyiz → hemen tara
+
+                close_dt = self._next_4h_close_utc()
+                log.info(f"🔍 [PREP] {close_dt.strftime('%H:%M')} kapanışına 5dk kala — "
+                         f"Universe taraması başlıyor…")
+
                 await self.scan_universe()
-                
+
                 # 🧹 ORPHAN CLEANER — Watchlist'te olup active trade'i OLMAYAN coinlerin stoplarını temizle
                 for sym in list(self.watchlist.keys()):
                     if sym not in self.active_trades:
                         await self._cancel_algo_orders(sym, retry=False)
-                        await asyncio.sleep(0.1)  # Rate limit koruması
-                
-                log.info(f"⏳ [v3.7] Sonraki universe taraması {Config.SCAN_INTERVAL_SEC}s sonra başlayacak…")
-            except Exception as e:
-                log.error(f"🔴 Scanner hatası: {e}")
-            await asyncio.sleep(Config.SCAN_INTERVAL_SEC)
+                        await asyncio.sleep(0.1)
 
-    async def _manager_loop(self):
+                log.info(f"✅ [PREP] Tarama tamamlandı — {len(self.watchlist)} coin watchlist'te. "
+                         f"Trigger {close_dt.strftime('%H:%M:%S')} UTC'de ateşlenecek.")
+
+                # Kapanış saatini geç → sonraki döngünün 4H hesabı doğru olsun
+                remaining = self._seconds_until_next_4h()
+                await asyncio.sleep(remaining + 30)
+
+            except Exception as e:
+                log.error(f"🔴 Prep Scan hatası: {e}")
+                await asyncio.sleep(60)
+
+    # ── GÖREV 2: TRIGGER_LOOP (Keskin Nişancı Girişi) ─────────────────
+
+    async def _trigger_loop(self):
         """
-        DÖNGÜ 2 — TRADE MANAGER: SADECE açık trade'leri yönetir (SL/TSL/BE/Green çıkış).
-        Her 5 saniyede bir çalışır. Rate limit safe — sadece açık pozisyonlar kontrol edilir.
+        GÖREV 2 — KESKİN NİŞANCI GİRİŞİ: Watchlist'teki coinlerin son KAPANMIŞ
+        mumunu kontrol eder, koşullar uygunsa SHORT açar.
+
+        ÇALIŞMA ZAMANI: Her 4H mum kapanışından TAM 1 SANİYE SONRA çalışır.
+          → 00:00:01, 04:00:01, 08:00:01, 12:00:01, 16:00:01, 20:00:01 UTC
+
+        MANTIK:
+          1. Sonraki 4H kapanışa kalan süre + 1 saniye bekle.
+          2. Watchlist'teki coinlerin OHLCV'sini çek (limit=3 yeterli).
+          3. Canlı mumu at → KAPANMIŞ son mumu al (iloc[-1] after _remove_live_candle).
+          4. check_entry_signal → kırmızı mum kontrolü.
+          5. Sinyal varsa open_short.
+          6. Sonraki 4H kapanışa kadar tekrar uyu.
+
+        NOT: _processed_signals (Tek Kurşun kilidi) kullanılmaya devam eder.
         """
+        TRIGGER_OFFSET_SEC = 1  # Kapanıştan 1 saniye sonra
+
         while self.running:
             try:
-                # Açık trade yoksa bekle (gereksiz API çağrısı yapma)
-                if not self.active_trades:
-                    await asyncio.sleep(Config.MANAGER_INTERVAL_SEC)
+                secs_to_close = self._seconds_until_next_4h()
+                wait_secs = secs_to_close + TRIGGER_OFFSET_SEC
+
+                if wait_secs > 5:
+                    trigger_time = datetime.now(timezone.utc) + timedelta(seconds=wait_secs)
+                    log.info(f"⏳ [TRIGGER] Sonraki kontrol {trigger_time.strftime('%H:%M:%S')} UTC'de "
+                             f"({wait_secs:.0f}s sonra)")
+
+                await asyncio.sleep(wait_secs)
+
+                log.info(f"🎯 [TRIGGER] 4H mum kapandı — {len(self.watchlist)} coin kontrol ediliyor…")
+
+                # Watchlist boş veya tüm slotlar doluysa atla
+                if not self.watchlist:
+                    log.info("  ℹ️ Watchlist boş — sinyal kontrolü atlanıyor")
+                    continue
+                if len(self.active_trades) >= Config.MAX_ACTIVE_TRADES:
+                    log.info(f"  ℹ️ Tüm slotlar dolu ({Config.MAX_ACTIVE_TRADES}/{Config.MAX_ACTIVE_TRADES}) — atlanıyor")
                     continue
 
-                # Equity al
+                # Equity al (tüm coinler için tek sefer)
                 try:
                     balance = await self._safe_call(self.exchange.fetch_balance)
-                    equity  = float(balance.get("total", {}).get("USDT", 10_000))
+                    equity = float(balance.get("total", {}).get("USDT", 10_000))
                 except Exception:
                     equity = 10_000
 
-                # Açık trade'leri yönet (SL/TSL/BE/Green çıkış)
-                await self.manage_open_trades(equity)
-
-            except Exception as e:
-                log.error(f"🔴 Trade Manager hatası: {e}")
-
-            await asyncio.sleep(Config.MANAGER_INTERVAL_SEC)
-
-    async def _watchlist_loop(self):
-        """
-        DÖNGÜ 3 — WATCHLIST SIGNAL CHECKER: Watchlist'teki coinleri sinyal için kontrol eder.
-        Her 60 saniyede bir çalışır (4H timeframe için yeterli).
-        Rate limit safe — sadece watchlist coinleri kontrol edilir.
-        """
-        while self.running:
-            try:
-                # Watchlist boşsa veya tüm slotlar doluysa bekle
-                if not self.watchlist or len(self.active_trades) >= Config.MAX_ACTIVE_TRADES:
-                    await asyncio.sleep(Config.WATCHLIST_CHECK_INTERVAL_SEC)
-                    continue
-
-                # Watchlist'teki her coini sinyal tetikleme için kontrol et
+                # Watchlist'teki her coini kontrol et
                 for sym, item in list(self.watchlist.items()):
                     if sym in self.active_trades:
                         continue
@@ -1173,7 +1314,9 @@ class PumpSnifferBot:
                     try:
                         df = await self.fetch_ohlcv(sym, Config.TIMEFRAME,
                                                     limit=Config.BB_LENGTH + 10)
-                        df = self._remove_live_candle(df, Config.TIMEFRAME)  # ✅ Canlı mumu doğru şekilde tespit et ve at
+                        df = self._remove_live_candle(df, Config.TIMEFRAME)
+                        if df.empty:
+                            continue
 
                         # Module 5: Yeni Push kontrolü (çıkış sonrası yeniden giriş)
                         if sym in self._post_exit_price:
@@ -1182,33 +1325,25 @@ class PumpSnifferBot:
                                 self._new_push[sym] = True
                             if not self._new_push.get(sym, True):
                                 log.debug(f"  {sym}: çıkış sonrası yeni push bekleniyor")
-                                continue  # Henüz yeni push yok
+                                continue
 
                         signal = self.check_entry_signal(df, item.pump_high)
 
-                        # Dinamik peak güncelleme: fiyat hâlâ zirvedeyse peak'i yükselt
+                        # Dinamik peak güncelleme
                         if "new_peak" in signal and signal["new_peak"] > item.pump_high:
                             item.pump_high = signal["new_peak"]
                             log.info(f"  📈 PEAK GÜNCELLEME: {sym}  "
                                      f"Yeni zirve: {item.pump_high:.6f}")
 
                         if signal["triggered"]:
-                            # Sinyal Tekilleştirme (Deduplication) — v3.6
+                            # Sinyal Tekilleştirme (Tek Kurşun Kilidi)
                             sig_ts = str(signal["signal_ts"])
                             if self._processed_signals.get(sym) == sig_ts:
-                                # Bu mumda zaten işlem açıldı veya denendi
                                 log.debug(f"  ⏭️  {sym}: Bu mum için sinyal zaten işlendi ({sig_ts})")
                                 continue
 
-                            log.info(f"  🎯 [v3.7] SİNYAL: {sym}  |  {'  '.join(signal['reasons'])}")
-                            self._processed_signals[sym] = sig_ts  # Sinyal işlendi olarak işaretle
-
-                            # Equity al
-                            try:
-                                balance = await self._safe_call(self.exchange.fetch_balance)
-                                equity = float(balance.get("total", {}).get("USDT", 10_000))
-                            except Exception:
-                                equity = 10_000
+                            log.info(f"  🎯 [v3.9] SİNYAL: {sym}  |  {'  '.join(signal['reasons'])}")
+                            self._processed_signals[sym] = sig_ts
 
                             await self.open_short(
                                 sym, signal["entry_price"], item, equity,
@@ -1216,42 +1351,77 @@ class PumpSnifferBot:
                                                              signal["entry_price"]),
                             )
                     except Exception as e:
-                        log.error(f"  Watchlist sinyal hatası ({sym}): {e}")
+                        log.error(f"  Trigger sinyal hatası ({sym}): {e}")
 
             except Exception as e:
-                log.error(f"🔴 Watchlist Checker hatası: {e}")
+                log.error(f"🔴 Trigger Loop hatası: {e}")
+                await asyncio.sleep(60)
 
-            await asyncio.sleep(Config.WATCHLIST_CHECK_INTERVAL_SEC)
+    # ── GÖREV 3: MANAGER_LOOP (Risk Yönetimi) ────────────────────────
+
+    async def _manager_loop(self):
+        """
+        GÖREV 3 — TRADE MANAGER: SADECE açık trade'leri yönetir (SL/TSL/BE/Green çıkış).
+        Her 5 saniyede bir çalışır. Rate limit safe — sadece açık pozisyonlar kontrol edilir.
+        Geçmiş fitillere bakmama ve anlık fiyatla TSL/BE hesaplama kuralları korunur.
+        """
+        while self.running:
+            try:
+                if not self.active_trades:
+                    await asyncio.sleep(Config.MANAGER_INTERVAL_SEC)
+                    continue
+
+                try:
+                    balance = await self._safe_call(self.exchange.fetch_balance)
+                    equity  = float(balance.get("total", {}).get("USDT", 10_000))
+                except Exception:
+                    equity = 10_000
+
+                await self.manage_open_trades(equity)
+
+            except Exception as e:
+                log.error(f"🔴 Trade Manager hatası: {e}")
+
+            await asyncio.sleep(Config.MANAGER_INTERVAL_SEC)
+
+    # ── ANA GİRİŞ NOKTASI ────────────────────────────────────────────
 
     async def run(self):
         """
-        TRI-LOOP Ana Giriş Noktası.
+        v3.9 — ZAMAN AYARLI 4H MİMARİSİ
 
-        Üç paralel async görev başlatır:
-          • scanner_loop   : Universe taraması (600s - ağır API yükü)
-          • manager_loop   : Açık trade yönetimi (5s - sadece aktif işlemler)
-          • watchlist_loop : Watchlist sinyal kontrolü (60s - yeni giriş fırsatları)
+        Üç bağımsız asenkron görev eşzamanlı başlatılır:
 
-        Rate limit optimizasyonu: Watchlist kontrolü her 60s → Binance ban riski yok.
+          GÖREV 1 • prep_scan_loop  : 4H kapanıştan 5dk ÖNCE → Universe taraması
+          GÖREV 2 • trigger_loop    : 4H kapanıştan 1sn SONRA → Sinyal kontrolü + SHORT
+          GÖREV 3 • manager_loop    : Her 5 saniye → Açık trade yönetimi (TSL/BE/SL)
+
+        Zamanlama örneği (08:00 UTC kapanışı):
+          07:55:00 → PREP taraması başlar, watchlist dolar
+          08:00:01 → TRIGGER uyanır, kapanmış mumu kontrol eder, SHORT açar
+          Sürekli  → MANAGER 5s aralıkla açık işlemleri izler
         """
         self.running = True
+        next_close = self._next_4h_close_utc()
+        prep_time  = next_close - timedelta(minutes=5)
         log.info("=" * 75)
-        log.info("  PUMP & DUMP REVERSION BOT v3.7 — TRI-LOOP BAŞLATILDI")
+        log.info("  PUMP & DUMP REVERSION BOT v3.9 — ZAMAN AYARLI 4H MİMARİSİ")
         log.info(f"  Kaldıraç: x{Config.LEVERAGE}  |  "
                  f"Top {Config.TOP_N_GAINERS} Gainer  |  "
                  f"Risk/trade: %{Config.RISK_PER_TRADE_PCT}")
-        log.info(f"  📡 Scanner: {Config.SCAN_INTERVAL_SEC}s  |  "
-                 f"⚡ Trade Manager: {Config.MANAGER_INTERVAL_SEC}s  |  "
-                 f"🎯 Watchlist: {Config.WATCHLIST_CHECK_INTERVAL_SEC}s")
+        log.info(f"  ⏰ Sonraki 4H kapanış: {next_close.strftime('%H:%M')} UTC  |  "
+                 f"Prep: {prep_time.strftime('%H:%M')} UTC")
+        log.info(f"  📡 PREP: kapanışa -5dk  |  "
+                 f"🎯 TRIGGER: kapanışa +1sn  |  "
+                 f"⚡ MANAGER: {Config.MANAGER_INTERVAL_SEC}s")
         log.info("=" * 75)
 
         try:
             await asyncio.gather(
-                self._scanner_loop(),
+                self._prep_scan_loop(),
+                self._trigger_loop(),
                 self._manager_loop(),
-                self._watchlist_loop(),
             )
-
         except KeyboardInterrupt:
             log.info("Bot durduruldu (Ctrl+C).")
         finally:
@@ -1451,6 +1621,7 @@ class Backtester:
             pump_cooldown_until: int = -1              # İlk kırmızı tüketilince 6-bar cooldown
 
             start_bar = Config.BB_LENGTH + 2
+            daily_df  = None  # detect_pump_at_bar imza uyumu (kullanılmıyor)
 
             for i in range(start_bar, len(df)):
                 bar      = df.iloc[i]
