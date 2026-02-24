@@ -513,7 +513,7 @@ class PumpSnifferBot:
             df_4h = await self.fetch_ohlcv(symbol, Config.TIMEFRAME, limit=n + 5)
             df_4h = self._remove_live_candle(df_4h, Config.TIMEFRAME)  # Canlı mumu doğru şekilde tespit et ve at
         except Exception as e:
-            log.debug(f"  {symbol} 4H veri çekilemedi: {e}")
+            log.debug(f"  {symbol} {Config.TIMEFRAME.upper()} veri çekilemedi: {e}")
             return None
 
         if len(df_4h) < n + 1:
@@ -555,7 +555,9 @@ class PumpSnifferBot:
         Son 6×4H mumda (24 saat) en yüksek %30+ pump yapan 10 coin izlenir.
         """
         universe = await self.fetch_universe()
-        log.info(f"🔍 {len(universe)} coin taranıyor (24H pump ≥ %{Config.PUMP_MIN_PCT}, 6×4H bazlı)…")
+        log.info(f"🔍 {len(universe)} coin taranıyor "
+                 f"(pump ≥ %{Config.PUMP_MIN_PCT}, "
+                 f"{Config.PUMP_WINDOW_CANDLES}×{Config.TIMEFRAME.upper()} bazlı)…")
 
         all_pumps: List[WatchlistItem] = []
 
