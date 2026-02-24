@@ -109,10 +109,10 @@ RISK_PER_TRADE_PCT = 2.0
 #  BÖLÜM 6 — TARAMA ARALIKLARI (Canlı Bot)
 # ──────────────────────────────────────────────────────────────────────
 
-SCAN_INTERVAL_SEC = 300
+SCAN_INTERVAL_SEC = 100
 # Universe tarama aralığı (saniye). Kaç saniyede bir tüm Binance futures taranır?
 
-WATCHLIST_CHECK_INTERVAL_SEC = 60
+WATCHLIST_CHECK_INTERVAL_SEC = 30
 # Watchlist sinyal kontrol aralığı (saniye).
 
 MANAGER_INTERVAL_SEC = 5
