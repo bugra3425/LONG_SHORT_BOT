@@ -646,15 +646,14 @@ class PumpSnifferBot:
             result["new_peak"] = curr["high"]
             return result
 
-        # KOŞUL 3: Giriş öncesi yeşil mumun gövdesi max %30 (sahte kırmızı filtresi)
+        # KOŞUL 3: Giriş öncesi mum YEŞİL olmalı (trend dönüşü teyidi)
+        # NOT: Gövde büyüklük filtresi kaldırıldı — pump coinlerinde önceki
+        #      yeşil mum doğal olarak devasa oluyor (%50-100+). Bu filtre
+        #      giriş fırsatlarını sistematik olarak engelliyordu.
         if len(df) >= 2:
             prev = df.iloc[-2]
             if prev["close"] <= prev["open"]:
                 result["reasons"].append("ÖNCEKİ MUM YEŞİL DEĞİL — giriş yok")
-                return result
-            prev_body_pct = (prev["close"] - prev["open"]) / prev["open"] * 100.0
-            if prev_body_pct > Config.PRE_CANDLE_GREEN_BODY_MAX_PCT:
-                result["reasons"].append(f"ÖNCEKİ YEŞİL FAZLA BÜYÜK (gövde %{prev_body_pct:.1f} > %{Config.PRE_CANDLE_GREEN_BODY_MAX_PCT}) — sahte kırmızı riski")
                 return result
 
         # Tüm koşullar sağlandı → SHORT sinyali
