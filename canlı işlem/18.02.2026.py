@@ -1228,29 +1228,54 @@ class PumpSnifferBot:
     # ─────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _seconds_until_next_4h() -> float:
-        """
-        Sonraki 4H mum kapanış zamanına (00/04/08/12/16/20 UTC) kalan saniyeyi döndürür.
-        Binance 4H mumları şu UTC saatlerinde kapanır: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00.
-        """
+    def _tf_to_minutes() -> int:
+        """Config.TIMEFRAME → dakika cinsinden periyot."""
+        tf = Config.TIMEFRAME.lower()
+        if tf.endswith("m"):
+            return int(tf[:-1])
+        if tf.endswith("h"):
+            return int(tf[:-1]) * 60
+        return 240  # fallback 4h
+
+    @staticmethod
+    def _prep_offset_sec() -> int:
+        """Timeframe'e göre dinamik PREP offset (kapanıştan kaç saniye önce tara)."""
+        tf_min = PumpSnifferBot._tf_to_minutes()
+        if tf_min <= 15:  return 2 * 60
+        if tf_min <= 30:  return 3 * 60
+        if tf_min <= 60:  return 5 * 60
+        if tf_min <= 120: return 8 * 60
+        return 10 * 60  # 4h+
+
+    @staticmethod
+    def _seconds_until_next_close() -> float:
+        """Sonraki mum kapanış zamanına kalan saniye (Config.TIMEFRAME'e göre)."""
+        period_min = PumpSnifferBot._tf_to_minutes()
         now = datetime.now(timezone.utc)
-        current_hour = now.hour
-        next_4h_hour = (current_hour // 4 + 1) * 4
-        if next_4h_hour >= 24:
-            next_dt = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-        else:
-            next_dt = now.replace(hour=next_4h_hour, minute=0, second=0, microsecond=0)
-        return max((next_dt - now).total_seconds(), 0)
+        total_sec = now.hour * 3600 + now.minute * 60 + now.second + now.microsecond / 1e6
+        period_sec = period_min * 60
+        elapsed = total_sec % period_sec
+        remaining = period_sec - elapsed
+        return max(remaining, 0)
+
+    @staticmethod
+    def _next_close_utc() -> datetime:
+        """Sonraki mum kapanış zamanını datetime olarak döndürür (Config.TIMEFRAME'e göre)."""
+        period_min = PumpSnifferBot._tf_to_minutes()
+        now = datetime.now(timezone.utc)
+        total_min = now.hour * 60 + now.minute
+        elapsed_min = total_min % period_min
+        remaining_min = period_min - elapsed_min
+        return (now.replace(second=0, microsecond=0) + timedelta(minutes=remaining_min))
+
+    # Geriye dönük uyumluluk aliasları
+    @staticmethod
+    def _seconds_until_next_4h() -> float:
+        return PumpSnifferBot._seconds_until_next_close()
 
     @staticmethod
     def _next_4h_close_utc() -> datetime:
-        """Sonraki 4H kapanış zamanını datetime olarak döndürür."""
-        now = datetime.now(timezone.utc)
-        current_hour = now.hour
-        next_4h_hour = (current_hour // 4 + 1) * 4
-        if next_4h_hour >= 24:
-            return now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-        return now.replace(hour=next_4h_hour, minute=0, second=0, microsecond=0)
+        return PumpSnifferBot._next_close_utc()
 
     # ── GÖREV 1: PREP_SCAN_LOOP (Hazırlık Radarı) ────────────────────
 
@@ -1271,11 +1296,11 @@ class PumpSnifferBot:
         Böylece trigger_loop 4H kapanışında uyanınca watchlist HAZIR olur.
         10 dakika ~300 coin taramak için yeterli süre sağlar.
         """
-        PREP_OFFSET_SEC = 10 * 60  # Kapanıştan 10 dakika önce
+        PREP_OFFSET_SEC = self._prep_offset_sec()  # Timeframe'e göre dinamik
 
         while self.running:
             try:
-                secs_to_close = self._seconds_until_next_4h()
+                secs_to_close = self._seconds_until_next_close()
                 prep_wait = secs_to_close - PREP_OFFSET_SEC
 
                 if prep_wait > 0:
@@ -1286,8 +1311,9 @@ class PumpSnifferBot:
                     await asyncio.sleep(prep_wait)
                 # else: Zaten prep penceresi içindeyiz → hemen tara
 
-                close_dt = self._next_4h_close_utc()
-                log.info(f"🔍 [PREP] {close_dt.strftime('%H:%M')} kapanışına 10dk kala — "
+                close_dt = self._next_close_utc()
+                prep_min = self._prep_offset_sec() // 60
+                log.info(f"🔍 [PREP] {close_dt.strftime('%H:%M')} kapanışına {prep_min}dk kala — "
                          f"Universe taraması başlıyor…")
 
                 # Yeni Event oluştur — bu döngünün trigger'ı bunu bekleyecek
@@ -1319,9 +1345,9 @@ class PumpSnifferBot:
                         f"Trigger {close_dt.strftime('%H:%M:%S')} UTC'de ateşlenecek "
                         f"({secs_left:.0f}s sonra).")
 
-                # Kapanış saatini geç → sonraki döngünün 4H hesabı doğru olsun
-                remaining = self._seconds_until_next_4h()
-                await asyncio.sleep(remaining + 30)
+                # Kapanış saatini geç → sonraki döngünün TF hesabı doğru olsun
+                remaining = self._seconds_until_next_close()
+                await asyncio.sleep(remaining + 5)
 
             except Exception as e:
                 log.error(f"🔴 Prep Scan hatası: {e}")
@@ -1351,7 +1377,7 @@ class PumpSnifferBot:
 
         while self.running:
             try:
-                secs_to_close = self._seconds_until_next_4h()
+                secs_to_close = self._seconds_until_next_close()
                 wait_secs = secs_to_close + TRIGGER_OFFSET_SEC
 
                 if wait_secs > 5:
@@ -1370,7 +1396,7 @@ class PumpSnifferBot:
                     except asyncio.TimeoutError:
                         log.warning("⚠️ [TRIGGER] PREP 120s içinde bitmedi — mevcut watchlist ile devam ediliyor.")
 
-                log.info(f"🎯 [TRIGGER] 4H mum kapandı — {len(self.watchlist)} coin kontrol ediliyor…")
+                log.info(f"🎯 [TRIGGER] {Config.TIMEFRAME.upper()} mum kapandı — {len(self.watchlist)} coin kontrol ediliyor…")
 
                 # Watchlist boş veya tüm slotlar doluysa atla
                 if not self.watchlist:
@@ -1481,30 +1507,27 @@ class PumpSnifferBot:
 
     async def run(self):
         """
-        v3.9 — ZAMAN AYARLI 4H MİMARİSİ
+        v3.9 — ZAMAN AYARLI MİMARİ ({tf})
 
         Üç bağımsız asenkron görev eşzamanlı başlatılır:
 
-          GÖREV 1 • prep_scan_loop  : 4H kapanıştan 10dk ÖNCE → Universe taraması
-          GÖREV 2 • trigger_loop    : 4H kapanıştan 2sn SONRA → Sinyal kontrolü + SHORT
+          GÖREV 1 • prep_scan_loop  : {tf} kapanıştan önce → Universe taraması
+          GÖREV 2 • trigger_loop    : {tf} kapanıştan 2sn SONRA → Sinyal kontrolü + SHORT
           GÖREV 3 • manager_loop    : Her 5 saniye → Açık trade yönetimi (TSL/BE/SL)
-
-        Zamanlama örneği (08:00 UTC kapanışı):
-          07:50:00 → PREP taraması başlar, watchlist dolar
-          08:00:02 → TRIGGER uyanır, kapanmış mumu kontrol eder, SHORT açar
-          Sürekli  → MANAGER 5s aralıkla açık işlemleri izler
         """
         self.running = True
-        next_close = self._next_4h_close_utc()
-        prep_time  = next_close - timedelta(minutes=10)
+        tf           = Config.TIMEFRAME.upper()
+        next_close   = self._next_close_utc()
+        prep_offset  = self._prep_offset_sec()
+        prep_time    = next_close - timedelta(seconds=prep_offset)
         log.info("=" * 75)
-        log.info("  PUMP & DUMP REVERSION BOT v3.9.4 — ZAMAN AYARLI 4H MİMARİSİ")
+        log.info(f"  PUMP & DUMP REVERSION BOT v3.9.4 — ZAMAN AYARLI {tf} MİMARİSİ")
         log.info(f"  Kaldıraç: x{Config.LEVERAGE}  |  "
                  f"Top {Config.TOP_N_GAINERS} Gainer  |  "
                  f"Risk/trade: %{Config.RISK_PER_TRADE_PCT}")
-        log.info(f"  ⏰ Sonraki 4H kapanış: {next_close.strftime('%H:%M')} UTC  |  "
+        log.info(f"  ⏰ Sonraki {tf} kapanış: {next_close.strftime('%H:%M')} UTC  |  "
                  f"Prep: {prep_time.strftime('%H:%M')} UTC")
-        log.info(f"  📡 PREP: kapanışa -10dk  |  "
+        log.info(f"  📡 PREP: kapanışa -{prep_offset//60}dk  |  "
                  f"🎯 TRIGGER: kapanışa +2sn  |  "
                  f"⚡ MANAGER: {Config.MANAGER_INTERVAL_SEC}s")
         log.info("=" * 75)
