@@ -1721,16 +1721,14 @@ class Backtester:
                             log.info(f"  [{bar_time}] ⚡ BE: {sym}  "
                                      f"Düşüş: %{drop_pct:.1f}")
 
-                    # Stage 2+3: 5m sub-barlar ile intra-bar gerçek yol simülasyonu
-                    # Her bar: önce HIGH → SL kontrol (olumsuz), sonra LOW → TSL güncelle (olumlu)
-                    # 5m yoksa tek 4H bar ile HIGH-önce konservatif yaklaşım
-                    _sub = _get_sub_bars(self.all_data_5m, sym, df.index[i])
-                    _sl_result = _eval_sl_tsl_on_bars(trade, _sub if _sub else [bar])
-                    if _sl_result:
-                        exit_p, reason = _sl_result
+                    # Stage 2: HIGH ÖNCE — SL vuruldu mu? (SHORT için olumsuz senaryo her zaman önce gelir)
+                    # 4H OHLCV hangi yönün önce oluştuğunu söylemez — SHORT için konservatif: HIGH önce
+                    if bar["high"] >= trade.stop_loss:
+                        exit_p  = trade.stop_loss
                         pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
                         pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
                         pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin (likit sınırı)
+                        reason  = "TSL-HIT" if trade.tsl_active else "STOP-LOSS"
                         trade.exit_time   = bar_time
                         trade.exit_price  = exit_p
                         trade.exit_reason = reason
@@ -1747,6 +1745,22 @@ class Backtester:
                         log.info(f"  [{bar_time}] 🔴 {reason} — {sym}  "
                                  f"Exit: {exit_p:.6f}  PnL: {pnl_usd:+.2f}")
                         continue
+
+                    # Stage 3: LOW SONRA — SL vurulmadıysa TSL güncelle
+                    low_drop_pct = (trade.entry_price - bar["low"]) / trade.entry_price * 100.0
+                    if not trade.tsl_active:
+                        if low_drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
+                            trade.tsl_active = True
+                            trade.lowest_low_reached = bar["low"]
+                            new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
+                            trade.stop_loss = min(trade.stop_loss, new_sl)
+                            log.info(f"  [{bar_time}] 🎯 TSL AKTİF: {sym}  "
+                                     f"Low: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
+                    else:
+                        if bar["low"] < trade.lowest_low_reached:
+                            trade.lowest_low_reached = bar["low"]
+                            new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
+                            trade.stop_loss = min(trade.stop_loss, new_sl)
 
                     # Stage 4: Zararda yeşil mum → SHORT kapat
                     if bar["close"] > bar["open"] and bar["close"] > trade.entry_price:
@@ -2275,16 +2289,14 @@ class FullUniverseBacktester:
                         print(f"\n  [{bar_str}] ⚡ BE {sym:<16}"
                               f" Düşüş: %{drop_pct:.1f}")
 
-                # Stage 2+3: 5m sub-barlar ile intra-bar gerçek yol simülasyonu
-                # Her bar: önce HIGH → SL kontrol (olumsuz), sonra LOW → TSL güncelle (olumlu)
-                # 5m yoksa tek 4H bar ile HIGH-önce konservatif yaklaşım
-                _sub = _get_sub_bars(self.all_data_5m, sym, ts)
-                _sl_result = _eval_sl_tsl_on_bars(trade, _sub if _sub else [bar])
-                if _sl_result:
-                    exit_p, reason = _sl_result
+                # Stage 2: HIGH ÖNCE — SL vuruldu mu? (SHORT için olumsuz senaryo her zaman önce gelir)
+                # 4H OHLCV hangi yönün önce oluştuğunu söylemez — SHORT için konservatif: HIGH önce
+                if bar["high"] >= trade.stop_loss:
+                    exit_p  = trade.stop_loss
                     raw_pnl = (trade.entry_price - exit_p) / trade.entry_price
                     pnl_usd = trade.position_size_usdt * trade.leverage * raw_pnl
                     pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin (likit sınırı)
+                    reason  = "TSL-HIT" if trade.tsl_active else "STOP-LOSS"
                     trade.exit_time   = bar_str
                     trade.exit_price  = exit_p
                     trade.exit_reason = reason
@@ -2301,6 +2313,22 @@ class FullUniverseBacktester:
                           f" exit: {exit_p:.6f}  PnL: {pnl_usd:>+8.4f}$"
                           f"  Equity: {equity:.4f}$")
                     continue
+
+                # Stage 3: LOW SONRA — SL vurulmadıysa TSL güncelle
+                low_drop_pct = (trade.entry_price - bar["low"]) / trade.entry_price * 100.0
+                if not trade.tsl_active:
+                    if low_drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
+                        trade.tsl_active = True
+                        trade.lowest_low_reached = bar["low"]
+                        new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
+                        trade.stop_loss = min(trade.stop_loss, new_sl)
+                        print(f"\n  [{bar_str}] 🎯 TSL-AKT {sym:<14}"
+                              f" Low: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
+                else:
+                    if bar["low"] < trade.lowest_low_reached:
+                        trade.lowest_low_reached = bar["low"]
+                        new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
+                        trade.stop_loss = min(trade.stop_loss, new_sl)
 
                 # Stage 4: Zararda yeşil mum → SHORT kapat
                 if bar["close"] > bar["open"] and bar["close"] > trade.entry_price:
