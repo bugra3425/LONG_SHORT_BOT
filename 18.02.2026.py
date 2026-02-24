@@ -648,13 +648,21 @@ class PumpSnifferBot:
             return result
 
         # KOŞUL 3: Giriş öncesi mum YEŞİL olmalı (trend dönüşü teyidi)
-        # NOT: Gövde büyüklük filtresi kaldırıldı — pump coinlerinde önceki
-        #      yeşil mum doğal olarak devasa oluyor (%50-100+). Bu filtre
-        #      giriş fırsatlarını sistematik olarak engelliyordu.
         if len(df) >= 2:
             prev = df.iloc[-2]
             if prev["close"] <= prev["open"]:
                 result["reasons"].append("ÖNCEKİ MUM YEŞİL DEĞİL — giriş yok")
+                return result
+
+            # KOŞUL 3b: ANTI-ROCKET FİLTRE — önceki tek mum >= %30 çıktıysa giriş yok
+            # Tek mumda devasa pump = sahte düşüş riski (fiyat pump öncesine dönebilir).
+            # Config.ANTI_ROCKET_SINGLE_CANDLE_PCT (varsayılan: %30)
+            prev_body_pct = (prev["close"] - prev["open"]) / prev["open"] * 100.0
+            if prev_body_pct >= Config.ANTI_ROCKET_SINGLE_CANDLE_PCT:
+                result["reasons"].append(
+                    f"ANTI-ROCKET: Önceki mum tek başına %{prev_body_pct:.1f} çıktı "
+                    f"(≥%{Config.ANTI_ROCKET_SINGLE_CANDLE_PCT}) — sahte düşüş riski, giriş yok"
+                )
                 return result
 
         # Tüm koşullar sağlandı → SHORT sinyali

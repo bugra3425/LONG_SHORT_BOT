@@ -62,6 +62,13 @@ async def scan_top10():
                 lows = [c[3] for c in analysis_candles]
                 pump_pct = ((max(highs) - min(lows)) / min(lows)) * 100
                 
+                # Anti-Rocket: bir önceki mumun tek başına yükselişi
+                prev_candle = analysis_candles[-1]  # tetikleyiciden önceki mum
+                if prev_candle[1] > 0:
+                    prev_body_pct = (prev_candle[4] - prev_candle[1]) / prev_candle[1] * 100.0
+                else:
+                    prev_body_pct = 0.0
+
                 # Kriterleri kontrol et
                 if green_count >= 4 and pump_pct >= 30:
                     pump_results.append({
@@ -69,78 +76,42 @@ async def scan_top10():
                         'green': green_count,
                         'pump': pump_pct,
                         'high': max(highs),
-                        'low': min(lows)
+                        'low': min(lows),
+                        'prev_body_pct': prev_body_pct,
                     })
                     
             except Exception as e:
                 continue
         
+        ANTI_ROCKET_PCT = 30.0  # Bot ile aynı eşik
+        valid   = [r for r in pump_results if r['prev_body_pct'] < ANTI_ROCKET_PCT]
+        blocked = [r for r in pump_results if r['prev_body_pct'] >= ANTI_ROCKET_PCT]
+
         print(f'\n✅ Tarama tamamlandı!')
-        print(f'📊 {len(pump_results)} coin kriterleri karşılıyor (≥4 yeşil, ≥30% pump)')
-        print('\n' + '='*120)
-        print('TOP 10 EN YÜKSEK PUMP (Bot kriterlerine göre)')
-        print('='*120)
-        print(f'{"Sıra":<6} {"Coin":<15} {"Yeşil":<8} {"Pump %":<12} {"Max High":<15} {"Min Low":<15}')
-        print('-'*120)
-        
-        # Sırala ve Top 10
-        pump_results.sort(key=lambda x: x['pump'], reverse=True)
-        
-        esp_index = None
-        for i, r in enumerate(pump_results[:20], 1):  # Top 20 göster
-            marker = ''
-            if r['symbol'] == 'ESP/USDT':
-                marker = ' <<<< ESP BULUNDU!'
-                esp_index = i
-            
-            print(f'{i:<6} {r["symbol"]:<15} {r["green"]}/6     {r["pump"]:>8.2f}%    {r["high"]:<15.8f} {r["low"]:<15.8f}{marker}')
-        
-        print('='*120)
-        
-        # ESP'nin durumu
-        if esp_index:
-            if esp_index <= 10:
-                print(f'\n✅ ESP/USDT {esp_index}. SIRADA → TOP 10\'DA → Watchlist\'e GİRMELİ!')
-            else:
-                print(f'\n⚠ ESP/USDT {esp_index}. SIRADA → TOP 10\'DA DEĞİL → Watchlist\'e GİREMEZ')
-        else:
-            # ESP'yi bul ve analizini göster
-            esp_data = next((r for r in pump_results if r['symbol'] == 'ESP/USDT'), None)
-            if esp_data:
-                esp_rank = pump_results.index(esp_data) + 1
-                print(f'\n📍 ESP/USDT {esp_rank}. SIRADA (≥30% + ≥4 yeşil var AMA diğerleri daha yüksek)')
-                print(f'   ESP: {esp_data["green"]}/6 yeşil, {esp_data["pump"]:.2f}% pump')
-            else:
-                print(f'\n❌ ESP/USDT kriterleri karşılamıyor (ya <4 yeşil ya da <30% pump)')
-                # ESP'yi direkt kontrol et
-                try:
-                    esp_ohlcv = await exchange.fetch_ohlcv('ESP/USDT', '4h', limit=7)
-                    if len(esp_ohlcv) >= 6:
-                        # Canlı mum kontrolü
-                        last_ts = esp_ohlcv[-1][0]
-                        now = datetime.now(timezone.utc).timestamp() * 1000
-                        end_ts = last_ts + (4 * 60 * 60 * 1000)
-                        
-                        if now < end_ts:
-                            esp_candles = esp_ohlcv[-7:-1]
-                        else:
-                            esp_candles = esp_ohlcv[-6:]
-                        
-                        esp_green = sum(1 for c in esp_candles if c[4] > c[1])
-                        esp_highs = [c[2] for c in esp_candles]
-                        esp_lows = [c[3] for c in esp_candles]
-                        esp_pump = ((max(esp_highs) - min(esp_lows)) / min(esp_lows)) * 100
-                        
-                        print(f'   ESP Detayları: {esp_green}/6 yeşil, {esp_pump:.2f}% pump')
-                        if esp_green < 4:
-                            print(f'   ❌ Yeşil mum yetersiz ({esp_green} < 4)')
-                        if esp_pump < 30:
-                            print(f'   ❌ Pump yetersiz ({esp_pump:.2f}% < 30%)')
-                except:
-                    pass
-        
-        print('='*120)
-        
+        print(f'📊 {len(pump_results)} coin ≥4 yeşil + ≥30% pump → '
+              f'{len(valid)} GEÇERLİ / {len(blocked)} ANTI-ROCKET (önceki mum ≥%{ANTI_ROCKET_PCT})')
+        print('\n' + '='*130)
+        print('✅ GEÇERLİ COINLER (Bot watchlist adayları)')
+        print('='*130)
+        print(f'{"Sıra":<6} {"Coin":<18} {"Yeşil":<8} {"Pump %":<12} {"Önceki Mum %":<16} {"Max High":<15} {"Min Low":<15}')
+        print('-'*130)
+        valid.sort(key=lambda x: x['pump'], reverse=True)
+        for i, r in enumerate(valid[:10], 1):
+            print(f'{i:<6} {r["symbol"]:<18} {r["green"]}/6     {r["pump"]:>8.2f}%    {r["prev_body_pct"]:>+10.1f}%      {r["high"]:<15.8f} {r["low"]:<15.8f}')
+        if not valid:
+            print('  (Geçerli coin yok)')
+
+        if blocked:
+            print(f'\n🚫 ANTI-ROCKET FİLTREDE TAKILDI (önceki tek mum ≥%{ANTI_ROCKET_PCT} — sahte düşüş riski)')
+            print('='*130)
+            print(f'{"Sıra":<6} {"Coin":<18} {"Yeşil":<8} {"Pump %":<12} {"Önceki Mum %":<16} {"Max High":<15} {"Min Low":<15}')
+            print('-'*130)
+            blocked.sort(key=lambda x: x['pump'], reverse=True)
+            for i, r in enumerate(blocked, 1):
+                print(f'{i:<6} {r["symbol"]:<18} {r["green"]}/6     {r["pump"]:>8.2f}%    {r["prev_body_pct"]:>+10.1f}%  ❌  {r["high"]:<15.8f} {r["low"]:<15.8f}')
+
+        print('\n' + '='*130)
+
     finally:
         await exchange.close()
 
