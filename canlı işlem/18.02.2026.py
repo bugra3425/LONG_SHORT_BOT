@@ -514,17 +514,20 @@ class PumpSnifferBot:
         if green_count < Config.PUMP_MIN_GREEN_COUNT:  # 4
             return None
 
-        # Koşul 2: Pencerenin LOW → HIGH net kazanımı >= %30
-        pump_high = max(c["high"] for c in window)
-        pump_low  = min(c["low"]  for c in window)
-        net_gain_pct = (pump_high - pump_low) / pump_low * 100.0
+        # Koşul 2: 1. mumun dibi → 6. mumun kapanışı net kazanımı >= %30
+        # pump_high: SL/Mod-2 referansı için penceredeki mutlak zirve
+        # pump_start_low: pump başlangıcı (1. mumun low'u) — hem hesap hem WatchlistItem'a
+        pump_high      = max(c["high"] for c in window)
+        pump_start_low = window[0]["low"]
+        current_close  = window[-1]["close"]
+        net_gain_pct   = (current_close - pump_start_low) / pump_start_low * 100.0
         if net_gain_pct < Config.PUMP_MIN_PCT:
             return None
 
         return WatchlistItem(
             symbol=symbol,
             pump_pct=round(net_gain_pct, 2),
-            pump_low=pump_low,
+            pump_low=pump_start_low,
             pump_high=pump_high,
             added_at=datetime.now(timezone.utc).isoformat(),
         )
@@ -1644,14 +1647,15 @@ class Backtester:
         if green_count < Config.PUMP_MIN_GREEN_COUNT:  # 4
             return None
 
-        # Koşul 2: Pencerenin LOW → HIGH net kazanımı >= %30
-        pump_high = max(c["high"] for c in window)
-        pump_low  = min(c["low"]  for c in window)
-        net_gain_pct = (pump_high - pump_low) / pump_low * 100.0
+        # Koşul 2: 1. mumun dibi → 6. mumun kapanışı net kazanımı >= %30
+        pump_high      = max(c["high"] for c in window)
+        pump_start_low = window[0]["low"]
+        current_close  = window[-1]["close"]
+        net_gain_pct   = (current_close - pump_start_low) / pump_start_low * 100.0
         if net_gain_pct < Config.PUMP_MIN_PCT:
             return None
 
-        return {"pump_pct": net_gain_pct, "pump_low": pump_low, "pump_high": pump_high}
+        return {"pump_pct": net_gain_pct, "pump_low": pump_start_low, "pump_high": pump_high}
 
     # ─────────────────────────────────────────────────────────────────
     # 3.3  BAR-BY-BAR SİMÜLASYON (v3 — Refined Scalper)
