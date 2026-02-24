@@ -1536,6 +1536,7 @@ class Backtester:
             _days = days or Config.BACKTEST_DAYS
             self.end_dt   = datetime.now(timezone.utc)
             self.start_dt = self.end_dt - timedelta(days=_days)
+        self.days = int((self.end_dt - self.start_dt).total_seconds() / 86400)
 
     # ─────────────────────────────────────────────────────────────────
     # 3.1  VERİ ÇEKME
