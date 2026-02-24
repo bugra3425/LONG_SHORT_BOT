@@ -1327,6 +1327,13 @@ class PumpSnifferBot:
                                 log.debug(f"  {sym}: çıkış sonrası yeni push bekleniyor")
                                 continue
 
+                        # Kapanmış mumun bilgilerini logla
+                        last = df.iloc[-1]
+                        candle_color = "🟢 YEŞİL" if last["close"] >= last["open"] else "🔴 KIRMIZI"
+                        candle_chg = (last["close"] - last["open"]) / last["open"] * 100.0
+                        log.info(f"  📊 {sym}: {candle_color}  O:{last['open']:.6f} → C:{last['close']:.6f}  "
+                                 f"({candle_chg:+.2f}%)  H:{last['high']:.6f}  L:{last['low']:.6f}")
+
                         signal = self.check_entry_signal(df, item.pump_high)
 
                         # Dinamik peak güncelleme
@@ -1339,7 +1346,7 @@ class PumpSnifferBot:
                             # Sinyal Tekilleştirme (Tek Kurşun Kilidi)
                             sig_ts = str(signal["signal_ts"])
                             if self._processed_signals.get(sym) == sig_ts:
-                                log.debug(f"  ⏭️  {sym}: Bu mum için sinyal zaten işlendi ({sig_ts})")
+                                log.info(f"  ⏭️  {sym}: Bu mum için sinyal zaten işlendi ({sig_ts})")
                                 continue
 
                             log.info(f"  🎯 [v3.9] SİNYAL: {sym}  |  {'  '.join(signal['reasons'])}")
@@ -1350,6 +1357,10 @@ class PumpSnifferBot:
                                 entry_candle_open=signal.get("entry_candle_open",
                                                              signal["entry_price"]),
                             )
+                        else:
+                            # Sinyal tetiklenmedi → NEDEN olduğunu logla
+                            reasons = signal.get("reasons", ["Bilinmeyen"])
+                            log.info(f"  ❌ {sym}: Giriş YOK — {' | '.join(reasons)}")
                     except Exception as e:
                         log.error(f"  Trigger sinyal hatası ({sym}): {e}")
 
