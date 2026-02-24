@@ -700,26 +700,53 @@ class PumpSnifferBot:
         """
         Doküman Madde 2: Algo emirleri (STOP_MARKET/TAKE_PROFIT_MARKET) standart
         fetch_open_orders / cancel_all_orders ile görünmez. Ayrı API gerektirir.
-        Bu metod hayalet algo emirleri temizler.
+        Bu metod HEM standart HEM algo stop emirlerini temizler.
         
-        v3.7: Retry + delay mekanizmalı (paranoid cleanup)
+        v3.9.5: Standart open orders + algo orders birlikte temizlenir.
+                 -4130 hatasının kök nedeni (orphan standart stop) çözüldü.
         """
         raw_sym = symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT")
         max_attempts = 2 if retry else 1
+        cleaned = 0
         
         for attempt in range(max_attempts):
             try:
-                open_algo = await self._safe_call(
-                    self.exchange.fapiPrivateGetOpenAlgoOrders,
-                    {"symbol": raw_sym}
-                )
-                orders = open_algo.get("orders", []) if isinstance(open_algo, dict) else []
-                if orders:
-                    await self._safe_call(
-                        self.exchange.fapiPrivateDeleteAlgoOpenOrders,
+                # 1) Standart açık emirleri temizle (STOP_MARKET dahil)
+                try:
+                    open_orders = await self._safe_call(
+                        self.exchange.fetch_open_orders, symbol
+                    )
+                    for order in open_orders:
+                        otype = (order.get("type") or "").upper()
+                        if otype in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"):
+                            try:
+                                await self._safe_call(
+                                    self.exchange.cancel_order, order["id"], symbol
+                                )
+                                cleaned += 1
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                # 2) Algo emirleri temizle
+                try:
+                    open_algo = await self._safe_call(
+                        self.exchange.fapiPrivateGetOpenAlgoOrders,
                         {"symbol": raw_sym}
                     )
-                    log.info(f"  🗑️ Algo emirler temizlendi: {symbol} ({len(orders)} emir)")
+                    orders = open_algo.get("orders", []) if isinstance(open_algo, dict) else []
+                    if orders:
+                        await self._safe_call(
+                            self.exchange.fapiPrivateDeleteAlgoOpenOrders,
+                            {"symbol": raw_sym}
+                        )
+                        cleaned += len(orders)
+                except Exception:
+                    pass
+
+                if cleaned > 0:
+                    log.info(f"  🗑️ Emirler temizlendi: {symbol} ({cleaned} emir)")
                     await asyncio.sleep(0.2)  # Binance senkronizasyonu için
                 return True
             except Exception as e:
@@ -974,7 +1001,7 @@ class PumpSnifferBot:
         """
         closed = []
 
-        for sym, trade in self.active_trades.items():
+        for sym, trade in list(self.active_trades.items()):
             try:
                 df_raw = await self.fetch_ohlcv(sym, Config.TIMEFRAME,
                                             limit=Config.BB_LENGTH + 5)
@@ -1063,7 +1090,34 @@ class PumpSnifferBot:
                 # ── Stage 3: SL Kontrol (CLOSE-BASED) ─────────────────────────
                 # CANLI mumun close'u (anlık fiyat) SL'yi aşarsa çık
                 if live["close"] >= trade.stop_loss:
-                    exit_p  = live["close"]
+                    # Önce Binance'te gerçek pozisyon var mı kontrol et
+                    real_exit_price = None
+                    try:
+                        positions = await self._safe_call(self.exchange.fetch_positions, [sym])
+                        has_position = False
+                        for pos in positions:
+                            if pos.get("symbol") == sym and abs(float(pos.get("contracts", 0))) > 0:
+                                has_position = True
+                                break
+                        if has_position:
+                            # Pozisyon hâlâ açık — market close yap
+                            await self._market_close_position(sym)
+                        else:
+                            # Binance'teki SL zaten tetiklendi, gerçek çıkış fiyatını al
+                            log.info(f"  ℹ️ {sym}: Pozisyon zaten Binance SL ile kapanmış.")
+                            try:
+                                recent_trades = await self._safe_call(
+                                    self.exchange.fetch_my_trades, sym, limit=5
+                                )
+                                if recent_trades:
+                                    last_t = recent_trades[-1]
+                                    real_exit_price = float(last_t.get("price", live["close"]))
+                            except Exception:
+                                pass
+                    except Exception:
+                        await self._market_close_position(sym)
+
+                    exit_p  = real_exit_price if real_exit_price else live["close"]
                     pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
                     pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
                     reason  = "TSL-HIT" if trade.tsl_active else "STOP-LOSS"
@@ -1076,9 +1130,7 @@ class PumpSnifferBot:
                     closed.append(sym)
                     self._post_exit_price[sym] = exit_p
                     self._new_push[sym] = False
-                    # 🔥 Fiziksel market close — Binance'te pozisyonu kapat
-                    await self._market_close_position(sym)
-                    # 🛡️ PARANOID CLEANUP — Ekstra güvenlik
+                    # 🛡️ PARANOID CLEANUP — Kalan emirleri temizle
                     await asyncio.sleep(0.3)
                     await self._cancel_algo_orders(sym, retry=False)
                     log.info(f"  🔴 {reason}: {sym}  |  PnL: {trade.pnl_usdt:+.2f} USDT")
@@ -2147,11 +2199,14 @@ class FullUniverseBacktester:
             tasks   = [self._fetch_ohlcv(sym) for sym in batch]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
+            # Minimum mum: pump window (6) + en az 2 analiz mumu = 8
+            min_candles = Config.PUMP_WINDOW_CANDLES + 2
+
             for sym, df in zip(batch, results):
                 if isinstance(df, Exception):
                     skipped += 1
                     continue
-                if not isinstance(df, pd.DataFrame) or df.empty or len(df) < 30:
+                if not isinstance(df, pd.DataFrame) or df.empty or len(df) < min_candles:
                     skipped += 1
                     continue
                 self.all_data[sym] = df

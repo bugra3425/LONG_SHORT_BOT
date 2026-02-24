@@ -38,7 +38,7 @@ async def _send_async(text: str, parse_mode: str = "HTML"):
             # Her chat ID'ye ayrı ayrı gönder
             for chat_id in chat_ids:
                 try:
-                    await client.post(
+                    resp = await client.post(
                         f"{_BASE_URL}/sendMessage",
                         json={
                             "chat_id": chat_id,
@@ -47,6 +47,21 @@ async def _send_async(text: str, parse_mode: str = "HTML"):
                             "disable_web_page_preview": True,
                         },
                     )
+                    if resp.status_code == 400:
+                        # HTML parse hatası olabilir — parse_mode'suz tekrar dene
+                        logger.warning(f"⚠️ Telegram 400 hatası, parse_mode kaldırılarak tekrar deneniyor...")
+                        resp2 = await client.post(
+                            f"{_BASE_URL}/sendMessage",
+                            json={
+                                "chat_id": chat_id,
+                                "text": text.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "").replace("<i>", "").replace("</i>", ""),
+                                "disable_web_page_preview": True,
+                            },
+                        )
+                        if resp2.status_code != 200:
+                            logger.error(f"❌ Telegram hâlâ başarısız: {resp2.status_code} | {resp2.text}")
+                    elif resp.status_code != 200:
+                        logger.warning(f"⚠️ Telegram yanıt: {resp.status_code} | {resp.text[:200]}")
                 except Exception as e:
                     logger.debug(f"📵 Chat ID {chat_id} gönderilemedi: {type(e).__name__}")
     except Exception as e:
