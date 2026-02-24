@@ -71,14 +71,18 @@ log = logging.getLogger("PumpDumpBot")
 # canlı işlem/params.py varsa oradan yükler, dosya yoksa varsayılan değerler kullanılır.
 def _load_params():
     import importlib.util
-    _path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "params.py")
-    if not os.path.exists(_path):
-        log.warning("⚠️  params.py bulunamadı — Config varsayılan değerleri kullanılıyor")
-        return None
-    spec = importlib.util.spec_from_file_location("params", _path)
-    mod  = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    _here = os.path.dirname(os.path.abspath(__file__))
+    # Önce aynı klasörde, sonra bir üst klasörde (root) ara
+    for _candidate in [os.path.join(_here, "params.py"),
+                       os.path.join(_here, "..", "params.py")]:
+        _path = os.path.normpath(_candidate)
+        if os.path.exists(_path):
+            spec = importlib.util.spec_from_file_location("params", _path)
+            mod  = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    log.warning("⚠️  params.py bulunamadı — Config varsayılan değerleri kullanılıyor")
+    return None
 
 _P = _load_params()
 
