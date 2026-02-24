@@ -984,113 +984,84 @@ class PumpSnifferBot:
 
     async def manage_open_trades(self, equity: float):
         """
-        The Shadow Tracker — 3 Aşamalı Dinamik Stop-Loss Yönetimi.
+        The Shadow Tracker v4.0 — TICKER BAZLI Dinamik Stop-Loss Yönetimi.
 
-        v3.8 FIX: CANLI MUM ODAKLI — Giriş mumunun geçmiş fitillerine aldanma
-        (Phantom Stop) hatası düzeltildi.
+        ÖNCEKİ SORUNLAR VE ÇÖZÜMLER:
+          • dict iteration crash      → list() kopyası üzerinden iterasyon
+          • Phantom Stop (fitil)     → OHLCV yerine TICKER (mark price) kullanımı
+          • -4130 orphan stop         → Kesin emir hiyerarşisi (önce temizle, sonra koy)
+          • Yanlış PnL (double-close) → Binance pozisyon kontrolü + gerçek çıkış fiyatı
 
-        Stage 1 — Breakeven  : %7 düşüşte SL = entry (sıfır kaybı garantile)
-                  → Binance'teki fiziksel stop emri güncellenir
-        Stage 2 — TSL Aktif  : %7 düşüşte Trailing Stop devreye girer
-                  → Her SL değişiminde Binance'teki stop emri güncellenir
-        Stage 3 — SL Kontrol : bar close >= SL → fiziksel market close
+        Stage 1 — Breakeven  : %{BREAKEVEN_DROP_PCT} düşüşte SL = entry
+        Stage 2 — TSL Aktif  : %{TSL_ACTIVATION_DROP_PCT} düşüşte Trailing Stop devreye girer
+        Stage 3 — SL Kontrol : current_price >= SL → fiziksel market close
         Stage 4 — Zararda yeşil mum → fiziksel market close (sadece KAPANMIŞ mumlar)
 
-        ÖNEMLİ: Stage 1-3 CANLI MUMU kullanır (iloc[-1]).
-                 Stage 4 (Yeşil mum çıkışları) KAPANMIŞ mumu kullanır (canlı mum atılır).
+        Stage 1-3: TICKER (mark/last price) kullanır — OHLCV çekmez.
+        Stage 4  : Sadece bu aşamada OHLCV çeker (kapanmış mum kontrolü).
         """
         closed = []
 
+        # ── KURAL 1: Async-safe iterasyon ──────────────────────────────
         for sym, trade in list(self.active_trades.items()):
             try:
-                df_raw = await self.fetch_ohlcv(sym, Config.TIMEFRAME,
-                                            limit=Config.BB_LENGTH + 5)
-                if df_raw.empty:
+                # ── KURAL 2: OHLCV yerine TICKER — anlık mark/last price ──
+                ticker = await self._safe_call(self.exchange.fetch_ticker, sym)
+                if not ticker:
                     continue
-
-                # ── CANLI MUM: BE / TSL / SL kontrolü için ────────────────────
-                # ASLA _remove_live_candle kullanma! Açık işlemler CANLI fiyata göre yönetilir.
-                live = df_raw.iloc[-1]
-
-                # ── GİRİŞ MUMU KORUMASI (Phantom Stop Fix) ────────────────────
-                # Eğer canlı mum, giriş mumunun AYNI periyodundaysa (yani bot giriş
-                # mumunu "live" olarak görüyorsa), o mumun geçmiş fitilleri (wick)
-                # TSL/BE hesaplarını bozar → bu iterasyonu ATLA.
-                # Giriş mumunun saat bilgisi trade.entry_time'da saklanır.
-                try:
-                    entry_dt = pd.Timestamp(trade.entry_time)
-                    live_candle_start = df_raw.index[-1]
-                    # Timeframe süresini hesapla
-                    tf_str = Config.TIMEFRAME.lower()
-                    if 'h' in tf_str:
-                        tf_delta = timedelta(hours=int(tf_str.replace('h', '')))
-                    elif 'm' in tf_str:
-                        tf_delta = timedelta(minutes=int(tf_str.replace('m', '')))
-                    elif 'd' in tf_str:
-                        tf_delta = timedelta(days=int(tf_str.replace('d', '')))
-                    else:
-                        tf_delta = timedelta(hours=4)
-
-                    # Giriş zamanı bu mumun periyodunda mı? (start <= entry < start + tf)
-                    live_candle_end = live_candle_start + tf_delta
-                    if live_candle_start <= entry_dt < live_candle_end:
-                        # Giriş mumunun içindeyiz — BE/TSL/SL kontrolü ATLA
-                        # Binance'teki ilk SL zaten koyuldu, bir sonraki mumu bekle
-                        log.debug(f"  ⏭️ {sym}: Giriş mumunun içindeyiz, BE/TSL/SL değerlendirmesi atlanıyor")
-                        continue
-                except Exception:
-                    pass  # entry_time parse edilemezse güvenli şekilde devam et
+                current_price = ticker.get("mark") or ticker.get("last")
+                if current_price is None:
+                    continue
+                current_price = float(current_price)
 
                 old_sl = trade.stop_loss  # SL değişimini takip etmek için
 
-                # ── Stage 1: Breakeven — %7 düşüşte SL = entry ────────────────
-                # CANLI mumun close'u (anlık fiyat) kullanılır
+                # ── Stage 1: Breakeven — düşüş >= %BREAKEVEN_DROP_PCT → SL = entry ─
                 if not trade.breakeven_triggered:
-                    price_drop_pct = (trade.entry_price - live["close"]) / trade.entry_price * 100.0
-                    if price_drop_pct >= Config.BREAKEVEN_DROP_PCT:
+                    drop_pct = (trade.entry_price - current_price) / trade.entry_price * 100.0
+                    if drop_pct >= Config.BREAKEVEN_DROP_PCT:
                         trade.stop_loss = trade.entry_price
                         trade.breakeven_triggered = True
                         trade.sl_moved_to_be = True
-                        log.info(f"  ⚡ BREAKEVEN: {sym}  Düşüş: %{price_drop_pct:.1f}  "
+                        log.info(f"  ⚡ BREAKEVEN: {sym}  Düşüş: %{drop_pct:.1f}  "
                                  f"SL → {trade.entry_price:.6f}")
-                        # 📲 BE bildirimi
                         try:
-                            notifier.send(f"⚡ <b>BREAKEVEN</b>\n🪙 {sym}\n📉 Düşüş: {price_drop_pct:.1f}%\n🛡️ SL → Giriş fiyatı")
+                            notifier.send(f"⚡ BREAKEVEN\n🪙 {sym}\n📉 Düşüş: {drop_pct:.1f}%\n🛡️ SL → Giriş fiyatı")
                         except Exception:
                             pass
 
-                # ── Stage 2: TSL — %7 düşüşte aktif, SL = lowest_low × 1.04 ──
-                # CANLI mumun low'u kullanılır (anlık en düşük)
-                bar_drop_pct = (trade.entry_price - live["low"]) / trade.entry_price * 100.0
+                # ── Stage 2: TSL — düşüş >= %TSL_ACTIVATION_DROP_PCT → trailing ───
+                drop_pct = (trade.entry_price - current_price) / trade.entry_price * 100.0
                 if not trade.tsl_active:
-                    if bar_drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
+                    if drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
                         trade.tsl_active = True
-                        trade.lowest_low_reached = live["low"]
+                        trade.lowest_low_reached = current_price
                         new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
                         trade.stop_loss = min(trade.stop_loss, new_sl)
-                        log.info(f"  🎯 TSL AKTİF: {sym}  Düşüş: %{bar_drop_pct:.1f}  "
+                        log.info(f"  🎯 TSL AKTİF: {sym}  Düşüş: %{drop_pct:.1f}  "
                                  f"Low: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
-                        # 📲 TSL aktivasyon bildirimi
                         try:
-                            notifier.send(f"🎯 <b>TSL AKTİF</b>\n🪙 {sym}\n📉 Düşüş: {bar_drop_pct:.1f}%\n🛡️ Trailing stop başlatıldı")
+                            notifier.send(f"🎯 TSL AKTİF\n🪙 {sym}\n📉 Düşüş: {drop_pct:.1f}%\n🛡️ Trailing stop başlatıldı")
                         except Exception:
                             pass
                 else:
-                    if live["low"] < trade.lowest_low_reached:
-                        trade.lowest_low_reached = live["low"]
+                    # TSL zaten aktif — yeni dip takibi
+                    if current_price < trade.lowest_low_reached:
+                        trade.lowest_low_reached = current_price
                         new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
                         trade.stop_loss = min(trade.stop_loss, new_sl)
                         log.info(f"  📉 TSL GÜNCELLE: {sym}  "
                                  f"YeniLow: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
 
-                # ── ADIM 2: SL değiştiyse Binance'teki fiziksel stop emrini güncelle ──
+                # ── KURAL 3: SL değiştiyse → ÖNCE temizle, SONRA güncelle ─────
                 if trade.stop_loss != old_sl:
+                    await self._cancel_algo_orders(sym, retry=True)
+                    await asyncio.sleep(0.2)
                     await self._update_binance_sl(sym, trade.stop_loss)
 
-                # ── Stage 3: SL Kontrol (CLOSE-BASED) ─────────────────────────
-                # CANLI mumun close'u (anlık fiyat) SL'yi aşarsa çık
-                if live["close"] >= trade.stop_loss:
-                    # Önce Binance'te gerçek pozisyon var mı kontrol et
+                # ── Stage 3: SL-Hit Kontrolü — current_price >= SL → kapat ────
+                if current_price >= trade.stop_loss:
+                    # Binance'te gerçek pozisyon var mı kontrol et
                     real_exit_price = None
                     try:
                         positions = await self._safe_call(self.exchange.fetch_positions, [sym])
@@ -1100,10 +1071,12 @@ class PumpSnifferBot:
                                 has_position = True
                                 break
                         if has_position:
-                            # Pozisyon hâlâ açık — market close yap
+                            # KURAL 3: Önce temizle, sonra kapat
+                            await self._cancel_algo_orders(sym, retry=True)
+                            await asyncio.sleep(0.2)
                             await self._market_close_position(sym)
                         else:
-                            # Binance'teki SL zaten tetiklendi, gerçek çıkış fiyatını al
+                            # Binance SL zaten tetiklenmiş — gerçek çıkış fiyatını al
                             log.info(f"  ℹ️ {sym}: Pozisyon zaten Binance SL ile kapanmış.")
                             try:
                                 recent_trades = await self._safe_call(
@@ -1111,13 +1084,17 @@ class PumpSnifferBot:
                                 )
                                 if recent_trades:
                                     last_t = recent_trades[-1]
-                                    real_exit_price = float(last_t.get("price", live["close"]))
+                                    real_exit_price = float(last_t.get("price", current_price))
                             except Exception:
                                 pass
+                            # Yine de orphan emirleri temizle
+                            await self._cancel_algo_orders(sym, retry=False)
                     except Exception:
+                        await self._cancel_algo_orders(sym, retry=True)
+                        await asyncio.sleep(0.2)
                         await self._market_close_position(sym)
 
-                    exit_p  = real_exit_price if real_exit_price else live["close"]
+                    exit_p  = real_exit_price if real_exit_price else current_price
                     pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
                     pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
                     reason  = "TSL-HIT" if trade.tsl_active else "STOP-LOSS"
@@ -1130,34 +1107,35 @@ class PumpSnifferBot:
                     closed.append(sym)
                     self._post_exit_price[sym] = exit_p
                     self._new_push[sym] = False
-                    # 🛡️ PARANOID CLEANUP — Kalan emirleri temizle
-                    await asyncio.sleep(0.3)
-                    await self._cancel_algo_orders(sym, retry=False)
                     log.info(f"  🔴 {reason}: {sym}  |  PnL: {trade.pnl_usdt:+.2f} USDT")
-                    # 📲 SL/TSL çıkış bildirimi
                     try:
                         notifier.notify_trade_close(sym, reason, trade.pnl_pct, trade.pnl_usdt)
                     except Exception:
                         pass
-                    continue
+                    continue  # Stage 3'te kapandı — Stage 4'e geçme
 
-                # ── Stage 4: Zararda yeşil mum → SHORT kapat ───────────────────
-                # SADECE KAPANMIŞ mumlar değerlendirilir (canlı mum henüz kapanmadı).
-                # Canlı mumu atarak kapanmış son mumu al.
-                df_closed = self._remove_live_candle(df_raw, Config.TIMEFRAME)
-                if df_closed.empty:
+                # ── KURAL 4: Stage 4 İZOLASYONU — Sadece burada OHLCV çek ─────
+                # İşlem hâlâ açık → kapanmış mum kontrolü için minimal OHLCV
+                try:
+                    df_raw = await self.fetch_ohlcv(sym, Config.TIMEFRAME, limit=3)
+                    if df_raw.empty:
+                        continue
+                    df_closed = self._remove_live_candle(df_raw, Config.TIMEFRAME)
+                    if df_closed.empty:
+                        continue
+                    closed_candle = df_closed.iloc[-1]
+                except Exception:
                     continue
-                closed_candle = df_closed.iloc[-1]
 
                 # Aynı kapanmış mumu tekrar saymamak için timestamp kontrolü
                 candle_ts = str(df_closed.index[-1])
                 if candle_ts == trade._last_checked_ts:
-                    # Bu mum zaten değerlendirildi — tekrar sayma
-                    pass
+                    pass  # Bu mum zaten değerlendirildi
                 elif closed_candle["close"] > closed_candle["open"] and closed_candle["close"] > trade.entry_price:
                     trade._last_checked_ts = candle_ts
                     green_body_pct = (closed_candle["close"] - closed_candle["open"]) / closed_candle["open"] * 100.0
-                    # Zararda tek yeşil mum gövdesi >= %10 → anında kapat (reversal olmadı)
+
+                    # Zararda tek yeşil mum gövdesi >= %10 → anında kapat
                     if green_body_pct >= Config.GREEN_LOSS_SINGLE_BODY_PCT:
                         exit_p  = closed_candle["close"]
                         pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
@@ -1171,18 +1149,17 @@ class PumpSnifferBot:
                         closed.append(sym)
                         self._post_exit_price[sym] = exit_p
                         self._new_push[sym] = False
-                        # 🔥 Fiziksel market close — Binance'te pozisyonu kapat
+                        # KURAL 3: Önce temizle, sonra kapat
+                        await self._cancel_algo_orders(sym, retry=True)
+                        await asyncio.sleep(0.2)
                         await self._market_close_position(sym)
-                        # 🛡️ PARANOID CLEANUP — Ekstra güvenlik
-                        await asyncio.sleep(0.3)
-                        await self._cancel_algo_orders(sym, retry=False)
                         log.info(f"  🟠 GREEN-10: {sym}  Gövde: %{green_body_pct:.1f}  Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT")
-                        # 📲 GREEN-10 çıkış bildirimi
                         try:
                             notifier.notify_trade_close(sym, "GREEN-10", trade.pnl_pct, trade.pnl_usdt)
                         except Exception:
                             pass
                         continue
+
                     # Küçük zararda yeşil → sayacı artır, 2'de kapat
                     trade.consec_green_loss += 1
                     if trade.consec_green_loss >= 2:
@@ -1198,13 +1175,11 @@ class PumpSnifferBot:
                         closed.append(sym)
                         self._post_exit_price[sym] = exit_p
                         self._new_push[sym] = False
-                        # 🔥 Fiziksel market close — Binance'te pozisyonu kapat
+                        # KURAL 3: Önce temizle, sonra kapat
+                        await self._cancel_algo_orders(sym, retry=True)
+                        await asyncio.sleep(0.2)
                         await self._market_close_position(sym)
-                        # 🛡️ PARANOID CLEANUP — Ekstra güvenlik
-                        await asyncio.sleep(0.3)
-                        await self._cancel_algo_orders(sym, retry=False)
                         log.info(f"  🟠 2xGREEN-LOSS: {sym}  Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT")
-                        # 📲 2xGREEN-LOSS çıkış bildirimi
                         try:
                             notifier.notify_trade_close(sym, "2xGREEN-LOSS", trade.pnl_pct, trade.pnl_usdt)
                         except Exception:
