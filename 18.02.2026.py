@@ -1273,7 +1273,7 @@ class PumpSnifferBot:
 
         NOT: _processed_signals (Tek Kurşun kilidi) kullanılmaya devam eder.
         """
-        TRIGGER_OFFSET_SEC = 1  # Kapanıştan 1 saniye sonra
+        TRIGGER_OFFSET_SEC = 3  # Kapanıştan 3 saniye sonra
 
         while self.running:
             try:
