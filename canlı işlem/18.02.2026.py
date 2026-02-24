@@ -300,7 +300,6 @@ class Config:
     BACKTEST_DAYS            = 31        # Son 31 gün
     BACKTEST_INITIAL_CAPITAL = 1000.0    # Başlangıç sermayesi (USDT)
     BACKTEST_SYMBOLS    = [
-        "VVV/USDT",  # DEBUG - kaldırılacak
         "TRB/USDT", "GAS/USDT", "CYBER/USDT", "LOOM/USDT",
         "YGG/USDT", "VANRY/USDT", "ORDI/USDT", "BIGTIME/USDT",
     ]
@@ -1507,6 +1506,62 @@ class PumpSnifferBot:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  BÖLÜM 2.9 — BACKTEST INTRA-BAR SİMÜLASYON YARDIMCILARI
+# ══════════════════════════════════════════════════════════════════════════
+
+def _eval_sl_tsl_on_bars(trade: TradeRecord, bars) -> Optional[Tuple[float, str]]:
+    """
+    Stage 2+3: SL ve TSL kontrolünü bar dizisi üzerinde gerçek sırayla yapar.
+
+    SHORT pozisyon için her bar'da değlendirme sırası:
+      1. HIGH → mevcut stop_loss'a değdi mi?  (olumsuz — ÖNCE kontrol)
+      2. LOW  → TSL güncelle                  (olumlu  — SONRA işle)
+
+    5m sub-barlar verilirse: intra-4H gerçek yol simüle edilir.
+    Tek 4H bar verilirse  : HIGH-önce konservatif yaklaşım uygulanır.
+      → "üylük yeşil mum önce SL'yi vurduysa" senaryosunu doğru yakalar.
+
+    trade nesnesi IN-PLACE güncellenir (TSL state değişkenleri).
+    Döndürür: (exit_price, reason) veya None (trade hâlâ açık)
+    """
+    for b in bars:
+        # 1. HIGH → stop_loss (önce olumsuz senaryoyu kontrol et)
+        if b["high"] >= trade.stop_loss:
+            reason = "TSL-HIT" if trade.tsl_active else "STOP-LOSS"
+            return (trade.stop_loss, reason)
+
+        # 2. LOW → TSL güncelle (SL vurulmadıysa olumlu senaryoyu işle)
+        low_drop = (trade.entry_price - b["low"]) / trade.entry_price * 100.0
+        if not trade.tsl_active:
+            if low_drop >= Config.TSL_ACTIVATION_DROP_PCT:
+                trade.tsl_active = True
+                trade.lowest_low_reached = b["low"]
+                new_sl = b["low"] * (1 + Config.TSL_TRAIL_PCT / 100.0)
+                trade.stop_loss = min(trade.stop_loss, new_sl)
+        else:
+            if b["low"] < trade.lowest_low_reached:
+                trade.lowest_low_reached = b["low"]
+                new_sl = b["low"] * (1 + Config.TSL_TRAIL_PCT / 100.0)
+                trade.stop_loss = min(trade.stop_loss, new_sl)
+
+    return None  # Bu bar dizisinde SL tetiklenmedi
+
+
+def _get_sub_bars(all_data_5m: dict, sym: str, bar_4h_ts) -> Optional[list]:
+    """
+    4H barına ait 5dk alt mumlarını döndür.
+    Döndürür: Row listesi (zamana göre sıralı) veya None (5m verisi yoksa)
+    """
+    if sym not in all_data_5m:
+        return None
+    df_5m = all_data_5m[sym]
+    bar_end = bar_4h_ts + timedelta(hours=4)
+    mask = (df_5m.index >= bar_4h_ts) & (df_5m.index < bar_end)
+    sub = df_5m[mask]
+    return [sub.iloc[k] for k in range(len(sub))] if not sub.empty else None
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  BÖLÜM 3 — BACKTESTER SINIFI
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1526,6 +1581,7 @@ class Backtester:
         self.capital   = initial_capital or Config.BACKTEST_INITIAL_CAPITAL
         self.exchange  = None   # async init'te set edilecek
         self.all_data: Dict[str, pd.DataFrame] = {}
+        self.all_data_5m: Dict[str, pd.DataFrame] = {}  # sym → 5m DataFrame (intra-bar sim)
         self.trades: List[TradeRecord] = []
         self.equity_curve: List[float] = []
 
@@ -1537,6 +1593,7 @@ class Backtester:
             _days = days or Config.BACKTEST_DAYS
             self.end_dt   = datetime.now(timezone.utc)
             self.start_dt = self.end_dt - timedelta(days=_days)
+        self.days = int((self.end_dt - self.start_dt).total_seconds() / 86400)
 
     # ─────────────────────────────────────────────────────────────────
     # 3.1  VERİ ÇEKME
@@ -1546,11 +1603,13 @@ class Backtester:
         """Public data için exchange bağlantısı (API key gereksiz)."""
         self.exchange = _make_binance_exchange()
 
-    async def _fetch_historical(self, symbol: str) -> pd.DataFrame:
+    async def _fetch_historical(self, symbol: str, timeframe: str = None) -> pd.DataFrame:
         """
-        Belirli bir sembolün tarih aralığındaki 4H verilerini çek.
-        Pump window için start_dt'den 6 mum (24 saat) önce başla.
+        Belirli bir sembolün tarih aralığındaki verilerini çek.
+        timeframe=None → Config.TIMEFRAME (4h) kullanılır.
+        Pump window için start_dt'den 6 mum önce başla.
         """
+        tf = timeframe or Config.TIMEFRAME
         fetch_start = self.start_dt - timedelta(hours=Config.PUMP_WINDOW_CANDLES * 4)
         since_ms    = int(fetch_start.timestamp() * 1000)
         until_ms    = int(self.end_dt.timestamp() * 1000)
@@ -1561,7 +1620,7 @@ class Backtester:
         while True:
             try:
                 candles = await self.exchange.fetch_ohlcv(
-                    symbol, Config.TIMEFRAME, since=since_cur, limit=limit
+                    symbol, tf, since=since_cur, limit=limit
                 )
             except Exception as e:
                 log.warning(f"  {symbol} veri çekme hatası: {e}")
@@ -1588,19 +1647,22 @@ class Backtester:
         return df
 
     async def load_data(self):
-        """Tüm backtest sembollerinin verisini çek."""
+        """Tüm backtest sembollerinin verisini çek (4H + 5m intra-bar sim için)."""
         await self._init_exchange()
-        log.info(f"📥 {len(self.symbols)} sembol için {self.days} günlük 4H veri çekiliyor…")
+        log.info(f"📥 {len(self.symbols)} sembol için {self.days} gün  4H + 5m veri çekiliyor…")
 
         for sym in self.symbols:
-            df = await self._fetch_historical(sym)
-            if df.empty:
-                log.warning(f"  ⚠️ {sym}: Veri bulunamadı — atlanıyor.")
+            df_4h = await self._fetch_historical(sym)
+            if df_4h.empty:
+                log.warning(f"  ⚠️ {sym}: 4H veri bulunamadı — atlanıyor.")
                 continue
-            self.all_data[sym] = df
-            log.info(f"  ✔ {sym}: {len(df)} mum yüklendi  "
-                     f"({df.index[0].strftime('%d.%m.%Y')} → {df.index[-1].strftime('%d.%m.%Y')})")
-            await asyncio.sleep(0.2)
+            df_5m = await self._fetch_historical(sym, "5m")
+            self.all_data[sym]    = df_4h
+            self.all_data_5m[sym] = df_5m
+            bars_5m = f"{len(df_5m)} 5m" if not df_5m.empty else "5m yok"
+            log.info(f"  ✔ {sym}: {len(df_4h)} 4H  |  {bars_5m}  "
+                     f"({df_4h.index[0].strftime('%d.%m.%Y')} → {df_4h.index[-1].strftime('%d.%m.%Y')})")
+            await asyncio.sleep(0.3)
 
         await self.exchange.close()
         log.info(f"📦 Toplam {len(self.all_data)} sembol yüklendi.\n")
@@ -1721,30 +1783,16 @@ class Backtester:
                             log.info(f"  [{bar_time}] ⚡ BE: {sym}  "
                                      f"Düşüş: %{drop_pct:.1f}")
 
-                    # Stage 2: TSL — %8 düşüşte aktif, SL = lowest_low × 1.03
-                    low_drop_pct = (trade.entry_price - bar["low"]) / trade.entry_price * 100.0
-                    if not trade.tsl_active:
-                        if low_drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
-                            trade.tsl_active = True
-                            trade.lowest_low_reached = bar["low"]
-                            new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
-                            trade.stop_loss = min(trade.stop_loss, new_sl)
-                            log.info(f"  [{bar_time}] 🎯 TSL AKTİF: {sym}  "
-                                     f"Low: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
-                    else:
-                        if bar["low"] < trade.lowest_low_reached:
-                            trade.lowest_low_reached = bar["low"]
-                            new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
-                            trade.stop_loss = min(trade.stop_loss, new_sl)
-
-                    # Stage 3: SL kontrolü (HIGH-BASED)
-                    # Exchange stop_market emri mum içi HIGH stop fiyatına değer değmez tetiklenir
-                    if bar["high"] >= trade.stop_loss:
-                        exit_p  = trade.stop_loss
+                    # Stage 2+3: 5m sub-barlar ile intra-bar gerçek yol simülasyonu
+                    # Her bar: önce HIGH → SL kontrol (olumsuz), sonra LOW → TSL güncelle (olumlu)
+                    # 5m yoksa tek 4H bar ile HIGH-önce konservatif yaklaşım
+                    _sub = _get_sub_bars(self.all_data_5m, sym, df.index[i])
+                    _sl_result = _eval_sl_tsl_on_bars(trade, _sub if _sub else [bar])
+                    if _sl_result:
+                        exit_p, reason = _sl_result
                         pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
                         pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
                         pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin (likit sınırı)
-                        reason  = "TSL-HIT" if trade.tsl_active else "STOP-LOSS"
                         trade.exit_time   = bar_time
                         trade.exit_price  = exit_p
                         trade.exit_reason = reason
@@ -1875,7 +1923,7 @@ class Backtester:
                 if prev_bar["close"] <= prev_bar["open"]:
                     continue  # önceki mum yeşil değil — giriş yok
                 prev_body_pct = (prev_bar["close"] - prev_bar["open"]) / prev_bar["open"] * 100.0
-                if prev_body_pct > Config.PRE_CANDLE_GREEN_BODY_MAX_PCT:
+                if prev_body_pct >= Config.ANTI_ROCKET_SINGLE_CANDLE_PCT:  # >= : canlı bot ile aynı
                     continue  # önceki yeşil mum fazla büyük — sahte kırmızı riski
 
                 pi_saved = pump_info
@@ -2063,6 +2111,7 @@ class FullUniverseBacktester:
         self.capital   = initial_capital or Config.BACKTEST_INITIAL_CAPITAL  # 100
         self.exchange  = None
         self.all_data: Dict[str, pd.DataFrame] = {}             # sym → 4H DataFrame
+        self.all_data_5m: Dict[str, pd.DataFrame] = {}          # sym → 5m DataFrame (intra-bar sim)
         self.trades: List[TradeRecord] = []
         self.equity_curve: List[float] = []
         self.universe: List[str] = []
@@ -2289,30 +2338,16 @@ class FullUniverseBacktester:
                         print(f"\n  [{bar_str}] ⚡ BE {sym:<16}"
                               f" Düşüş: %{drop_pct:.1f}")
 
-                # Stage 2: TSL — %8 düşüşte aktif, SL = lowest_low × 1.03
-                low_drop_pct = (trade.entry_price - bar["low"]) / trade.entry_price * 100.0
-                if not trade.tsl_active:
-                    if low_drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
-                        trade.tsl_active = True
-                        trade.lowest_low_reached = bar["low"]
-                        new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
-                        trade.stop_loss = min(trade.stop_loss, new_sl)
-                        print(f"\n  [{bar_str}] 🎯 TSL-AKT {sym:<14}"
-                              f" Low: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
-                else:
-                    if bar["low"] < trade.lowest_low_reached:
-                        trade.lowest_low_reached = bar["low"]
-                        new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
-                        trade.stop_loss = min(trade.stop_loss, new_sl)
-
-                # Stage 3: SL kontrolü (HIGH-BASED)
-                # Exchange stop_market emri mum içi HIGH stop fiyatına değer değmez tetiklenir
-                if bar["high"] >= trade.stop_loss:
-                    exit_p  = trade.stop_loss
+                # Stage 2+3: 5m sub-barlar ile intra-bar gerçek yol simülasyonu
+                # Her bar: önce HIGH → SL kontrol (olumsuz), sonra LOW → TSL güncelle (olumlu)
+                # 5m yoksa tek 4H bar ile HIGH-önce konservatif yaklaşım
+                _sub = _get_sub_bars(self.all_data_5m, sym, ts)
+                _sl_result = _eval_sl_tsl_on_bars(trade, _sub if _sub else [bar])
+                if _sl_result:
+                    exit_p, reason = _sl_result
                     raw_pnl = (trade.entry_price - exit_p) / trade.entry_price
                     pnl_usd = trade.position_size_usdt * trade.leverage * raw_pnl
                     pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin (likit sınırı)
-                    reason  = "TSL-HIT" if trade.tsl_active else "STOP-LOSS"
                     trade.exit_time   = bar_str
                     trade.exit_price  = exit_p
                     trade.exit_reason = reason
@@ -2408,16 +2443,18 @@ class FullUniverseBacktester:
                 if green_count < Config.PUMP_MIN_GREEN_COUNT:  # 4
                     continue
 
-                # Koşul 2: Pencerenin LOW → HIGH net kazanımı >= %30
-                pump_high = max(c["high"] for c in window)
-                pump_low  = min(c["low"]  for c in window)
-                net_gain_pct = (pump_high - pump_low) / pump_low * 100.0
+                # Koşul 2: 1. mumun dibi → 6. mumun kapanışı net kazanımı >= %30
+                # (detect_pump_at_bar ile aynı formül — tutarlılık için)
+                pump_high      = max(c["high"] for c in window)
+                pump_start_low = window[0]["low"]
+                current_close  = window[-1]["close"]
+                net_gain_pct   = (current_close - pump_start_low) / pump_start_low * 100.0
                 if net_gain_pct < Config.PUMP_MIN_PCT:
                     continue
 
                 candidates.append((net_gain_pct, sym, {
                     "pump_pct": net_gain_pct,
-                    "pump_low": pump_low,
+                    "pump_low": pump_start_low,
                     "pump_high": pump_high,
                 }))
 
@@ -2504,7 +2541,7 @@ class FullUniverseBacktester:
                 if prev_bar["close"] <= prev_bar["open"]:
                     continue  # önceki mum yeşil değil — giriş yok
                 prev_body_pct = (prev_bar["close"] - prev_bar["open"]) / prev_bar["open"] * 100.0
-                if prev_body_pct > Config.PRE_CANDLE_GREEN_BODY_MAX_PCT:
+                if prev_body_pct >= Config.ANTI_ROCKET_SINGLE_CANDLE_PCT:  # >= : canlı bot ile aynı
                     continue  # önceki yeşil mum fazla büyük — sahte kırmızı riski
 
                 consumed_signals.add(sym)

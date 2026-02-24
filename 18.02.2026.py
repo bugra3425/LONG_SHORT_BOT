@@ -300,7 +300,6 @@ class Config:
     BACKTEST_DAYS            = 31        # Son 31 gün
     BACKTEST_INITIAL_CAPITAL = 1000.0    # Başlangıç sermayesi (USDT)
     BACKTEST_SYMBOLS    = [
-        "VVV/USDT",  # DEBUG - kaldırılacak
         "TRB/USDT", "GAS/USDT", "CYBER/USDT", "LOOM/USDT",
         "YGG/USDT", "VANRY/USDT", "ORDI/USDT", "BIGTIME/USDT",
     ]
@@ -1628,9 +1627,10 @@ class Backtester:
         Module 1 (Backtest): Son 6 adet 4H mumda (24 saatlik rolling pencere)
         net yükseliş >= %30 ve yüksek, düşükten SONRA gerçekleşmiş mi?
 
-        rolling_low  = 6 mumun en düşük LOW'ı
-        rolling_high = 6 mumun en yüksek HIGH'ı
-        net_gain = (rolling_high - rolling_low) / rolling_low
+        pump_start_low = window[0] (1. mumun LOW'u) — pump başlangıcı
+        current_close  = window[-1] (6. mumun kapanışı) — şimdi neredeyiz?
+        net_gain = (current_close - pump_start_low) / pump_start_low
+        pump_high = tüm penceredeki mutlak zirve (SL ve Module 2 referansı için)
         daily_df parametresi kullanılmıyor (geriye dönük uyumluluk).
         """
         n = Config.PUMP_WINDOW_CANDLES  # 6
@@ -1721,30 +1721,16 @@ class Backtester:
                             log.info(f"  [{bar_time}] ⚡ BE: {sym}  "
                                      f"Düşüş: %{drop_pct:.1f}")
 
-                    # Stage 2: TSL — %8 düşüşte aktif, SL = lowest_low × 1.03
-                    low_drop_pct = (trade.entry_price - bar["low"]) / trade.entry_price * 100.0
-                    if not trade.tsl_active:
-                        if low_drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
-                            trade.tsl_active = True
-                            trade.lowest_low_reached = bar["low"]
-                            new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
-                            trade.stop_loss = min(trade.stop_loss, new_sl)
-                            log.info(f"  [{bar_time}] 🎯 TSL AKTİF: {sym}  "
-                                     f"Low: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
-                    else:
-                        if bar["low"] < trade.lowest_low_reached:
-                            trade.lowest_low_reached = bar["low"]
-                            new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
-                            trade.stop_loss = min(trade.stop_loss, new_sl)
-
-                    # Stage 3: SL kontrolü (HIGH-BASED)
-                    # Exchange stop_market emri mum içi HIGH stop fiyatına değer değmez tetiklenir
-                    if bar["high"] >= trade.stop_loss:
-                        exit_p  = trade.stop_loss
+                    # Stage 2+3: 5m sub-barlar ile intra-bar gerçek yol simülasyonu
+                    # Her bar: önce HIGH → SL kontrol (olumsuz), sonra LOW → TSL güncelle (olumlu)
+                    # 5m yoksa tek 4H bar ile HIGH-önce konservatif yaklaşım
+                    _sub = _get_sub_bars(self.all_data_5m, sym, df.index[i])
+                    _sl_result = _eval_sl_tsl_on_bars(trade, _sub if _sub else [bar])
+                    if _sl_result:
+                        exit_p, reason = _sl_result
                         pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
                         pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
                         pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin (likit sınırı)
-                        reason  = "TSL-HIT" if trade.tsl_active else "STOP-LOSS"
                         trade.exit_time   = bar_time
                         trade.exit_price  = exit_p
                         trade.exit_reason = reason
@@ -1875,7 +1861,7 @@ class Backtester:
                 if prev_bar["close"] <= prev_bar["open"]:
                     continue  # önceki mum yeşil değil — giriş yok
                 prev_body_pct = (prev_bar["close"] - prev_bar["open"]) / prev_bar["open"] * 100.0
-                if prev_body_pct > Config.PRE_CANDLE_GREEN_BODY_MAX_PCT:
+                if prev_body_pct >= Config.ANTI_ROCKET_SINGLE_CANDLE_PCT:  # >= : canlı bot ile aynı
                     continue  # önceki yeşil mum fazla büyük — sahte kırmızı riski
 
                 pi_saved = pump_info
@@ -2289,30 +2275,16 @@ class FullUniverseBacktester:
                         print(f"\n  [{bar_str}] ⚡ BE {sym:<16}"
                               f" Düşüş: %{drop_pct:.1f}")
 
-                # Stage 2: TSL — %8 düşüşte aktif, SL = lowest_low × 1.03
-                low_drop_pct = (trade.entry_price - bar["low"]) / trade.entry_price * 100.0
-                if not trade.tsl_active:
-                    if low_drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
-                        trade.tsl_active = True
-                        trade.lowest_low_reached = bar["low"]
-                        new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
-                        trade.stop_loss = min(trade.stop_loss, new_sl)
-                        print(f"\n  [{bar_str}] 🎯 TSL-AKT {sym:<14}"
-                              f" Low: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
-                else:
-                    if bar["low"] < trade.lowest_low_reached:
-                        trade.lowest_low_reached = bar["low"]
-                        new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
-                        trade.stop_loss = min(trade.stop_loss, new_sl)
-
-                # Stage 3: SL kontrolü (HIGH-BASED)
-                # Exchange stop_market emri mum içi HIGH stop fiyatına değer değmez tetiklenir
-                if bar["high"] >= trade.stop_loss:
-                    exit_p  = trade.stop_loss
+                # Stage 2+3: 5m sub-barlar ile intra-bar gerçek yol simülasyonu
+                # Her bar: önce HIGH → SL kontrol (olumsuz), sonra LOW → TSL güncelle (olumlu)
+                # 5m yoksa tek 4H bar ile HIGH-önce konservatif yaklaşım
+                _sub = _get_sub_bars(self.all_data_5m, sym, ts)
+                _sl_result = _eval_sl_tsl_on_bars(trade, _sub if _sub else [bar])
+                if _sl_result:
+                    exit_p, reason = _sl_result
                     raw_pnl = (trade.entry_price - exit_p) / trade.entry_price
                     pnl_usd = trade.position_size_usdt * trade.leverage * raw_pnl
                     pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin (likit sınırı)
-                    reason  = "TSL-HIT" if trade.tsl_active else "STOP-LOSS"
                     trade.exit_time   = bar_str
                     trade.exit_price  = exit_p
                     trade.exit_reason = reason
@@ -2408,16 +2380,18 @@ class FullUniverseBacktester:
                 if green_count < Config.PUMP_MIN_GREEN_COUNT:  # 4
                     continue
 
-                # Koşul 2: Pencerenin LOW → HIGH net kazanımı >= %30
-                pump_high = max(c["high"] for c in window)
-                pump_low  = min(c["low"]  for c in window)
-                net_gain_pct = (pump_high - pump_low) / pump_low * 100.0
+                # Koşul 2: 1. mumun dibi → 6. mumun kapanışı net kazanımı >= %30
+                # (detect_pump_at_bar ile aynı formül — tutarlılık için)
+                pump_high      = max(c["high"] for c in window)
+                pump_start_low = window[0]["low"]
+                current_close  = window[-1]["close"]
+                net_gain_pct   = (current_close - pump_start_low) / pump_start_low * 100.0
                 if net_gain_pct < Config.PUMP_MIN_PCT:
                     continue
 
                 candidates.append((net_gain_pct, sym, {
                     "pump_pct": net_gain_pct,
-                    "pump_low": pump_low,
+                    "pump_low": pump_start_low,
                     "pump_high": pump_high,
                 }))
 
@@ -2504,7 +2478,7 @@ class FullUniverseBacktester:
                 if prev_bar["close"] <= prev_bar["open"]:
                     continue  # önceki mum yeşil değil — giriş yok
                 prev_body_pct = (prev_bar["close"] - prev_bar["open"]) / prev_bar["open"] * 100.0
-                if prev_body_pct > Config.PRE_CANDLE_GREEN_BODY_MAX_PCT:
+                if prev_body_pct >= Config.ANTI_ROCKET_SINGLE_CANDLE_PCT:  # >= : canlı bot ile aynı
                     continue  # önceki yeşil mum fazla büyük — sahte kırmızı riski
 
                 consumed_signals.add(sym)
