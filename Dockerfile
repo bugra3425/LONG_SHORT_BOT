@@ -47,6 +47,7 @@ COPY --from=builder /install /usr/local
 
 # Copy application files
 COPY 18.02.2026.py .
+COPY params.py .
 COPY src/ ./src/
 COPY run.py .
 COPY config_example.py .
