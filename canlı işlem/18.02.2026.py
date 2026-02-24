@@ -333,6 +333,7 @@ class PumpSnifferBot:
         self._post_exit_price: Dict[str, float] = {}   # sym → son çıkış fiyatı (yeni push takibi)
         self._new_push: Dict[str, bool] = {}            # sym → çıkış sonrası yeni push görüldü mü?
         self._processed_signals: Dict[str, str] = {}    # sym → son sinyal timestamp (Tekilleştirme)
+        self._prep_done: Optional[asyncio.Event] = None  # PREP→TRIGGER senkronizasyonu
         self.running = False
 
     # ─────────────────────────────────────────────────────────────────
@@ -1234,6 +1235,9 @@ class PumpSnifferBot:
                 log.info(f"🔍 [PREP] {close_dt.strftime('%H:%M')} kapanışına 5dk kala — "
                          f"Universe taraması başlıyor…")
 
+                # Yeni Event oluştur — bu döngünün trigger'ı bunu bekleyecek
+                self._prep_done = asyncio.Event()
+
                 await self.scan_universe()
 
                 # 🧹 ORPHAN CLEANER — Watchlist'te olup active trade'i OLMAYAN coinlerin stoplarını temizle
@@ -1242,8 +1246,23 @@ class PumpSnifferBot:
                         await self._cancel_algo_orders(sym, retry=False)
                         await asyncio.sleep(0.1)
 
-                log.info(f"✅ [PREP] Tarama tamamlandı — {len(self.watchlist)} coin watchlist'te. "
-                         f"Trigger {close_dt.strftime('%H:%M:%S')} UTC'de ateşlenecek.")
+                # PREP bitti → Trigger'a "watchlist hazır" sinyali ver
+                self._prep_done.set()
+
+                now_utc = datetime.now(timezone.utc)
+                if now_utc >= close_dt:
+                    # PREP taraması kapanış saatinden SONRA bitti
+                    log.warning(
+                        f"⚠️ [PREP] Tarama tamamlandı — {len(self.watchlist)} coin watchlist'te. "
+                        f"UYARI: Tarama {close_dt.strftime('%H:%M')} kapanışından SONRA bitti "
+                        f"({now_utc.strftime('%H:%M:%S')} UTC). "
+                        f"Trigger zaten ateşlendi, bir sonraki 4H kapanışı bekleniyor.")
+                else:
+                    secs_left = (close_dt - now_utc).total_seconds()
+                    log.info(
+                        f"✅ [PREP] Tarama tamamlandı — {len(self.watchlist)} coin watchlist'te. "
+                        f"Trigger {close_dt.strftime('%H:%M:%S')} UTC'de ateşlenecek "
+                        f"({secs_left:.0f}s sonra).")
 
                 # Kapanış saatini geç → sonraki döngünün 4H hesabı doğru olsun
                 remaining = self._seconds_until_next_4h()
@@ -1286,6 +1305,15 @@ class PumpSnifferBot:
                              f"({wait_secs:.0f}s sonra)")
 
                 await asyncio.sleep(wait_secs)
+
+                # PREP taraması henüz bitmemişse bekle (max 120 saniye)
+                if self._prep_done and not self._prep_done.is_set():
+                    log.info("⏳ [TRIGGER] PREP taraması henüz bitmedi — watchlist hazır olana kadar bekleniyor…")
+                    try:
+                        await asyncio.wait_for(self._prep_done.wait(), timeout=120)
+                        log.info("✅ [TRIGGER] PREP tamamlandı — devam ediliyor.")
+                    except asyncio.TimeoutError:
+                        log.warning("⚠️ [TRIGGER] PREP 120s içinde bitmedi — mevcut watchlist ile devam ediliyor.")
 
                 log.info(f"🎯 [TRIGGER] 4H mum kapandı — {len(self.watchlist)} coin kontrol ediliyor…")
 
