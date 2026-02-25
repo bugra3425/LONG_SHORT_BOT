@@ -349,6 +349,7 @@ class PumpSnifferBot:
         self.watchlist: Dict[str, WatchlistItem] = {}
         self.active_trades: Dict[str, TradeRecord] = {}
         self.trade_history: List[TradeRecord] = []
+        self._seen_symbols: set = set()            # Hiç işlem açılan tüm semboller (orfan emir tarama için)
         self._post_exit_price: Dict[str, float] = {}   # sym → son çıkış fiyatı (yeni push takibi)
         self._new_push: Dict[str, bool] = {}            # sym → çıkış sonrası yeni push görüldü mü?
         self._processed_signals: Dict[str, str] = {}    # sym → son sinyal timestamp (Tekilleştirme)
@@ -390,8 +391,14 @@ class PumpSnifferBot:
         try:
             import json
             data = {sym: asdict(trade) for sym, trade in self.active_trades.items()}
+            # _seen_symbols'ü de kaydet (orfan emir tarama için)
+            self._seen_symbols.update(self.active_trades.keys())
+            out = {
+                "trades": data,
+                "seen_symbols": list(self._seen_symbols),
+            }
             with open(self.STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+                json.dump(out, f, indent=2, ensure_ascii=False)
             log.debug(f"💾 Durum kaydedildi: {len(data)} açık trade")
         except Exception as e:
             log.warning(f"⚠️ Durum kaydedilemedi: {e}")
@@ -403,13 +410,21 @@ class PumpSnifferBot:
             if not os.path.exists(self.STATE_FILE):
                 return
             with open(self.STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                raw = json.load(f)
+            # Eski format (düz dict) veya yeni format ({trades:..., seen_symbols:...}) destekle
+            if "trades" in raw:
+                data = raw["trades"]
+                self._seen_symbols = set(raw.get("seen_symbols", []))
+            else:
+                data = raw  # eski format
+                self._seen_symbols = set()
             valid_fields = {f.name for f in dataclasses.fields(TradeRecord)}
             count = 0
             for sym, td in data.items():
                 try:
                     td_filtered = {k: v for k, v in td.items() if k in valid_fields}
                     self.active_trades[sym] = TradeRecord(**td_filtered)
+                    self._seen_symbols.add(sym)
                     count += 1
                 except Exception as ex:
                     log.warning(f"⚠️ {sym} trade yüklenemedi: {ex}")
@@ -519,11 +534,25 @@ class PumpSnifferBot:
                 if act >= trade.entry_price:
                     log.error(f"  ❌ {sym}: TSL aktivasyon yönü hatalı, atlandı")
                     continue
+
+                # Mevcut fiyatı al — aktivasyon zaten geçildiyse activationPrice gönderme
+                try:
+                    ticker = await self._safe_call(self.exchange.fetch_ticker, sym)
+                    current_price = float(ticker.get("mark") or ticker.get("last") or 0)
+                except Exception:
+                    current_price = 0.0
+
                 tsl_params = {
-                    "activationPrice": act,
-                    "callbackRate"   : Config.TSL_TRAIL_PCT,
-                    "workingType"    : "MARK_PRICE",
+                    "callbackRate": Config.TSL_TRAIL_PCT,
+                    "workingType" : "MARK_PRICE",
                 }
+                # BUY trailing stop: activationPrice mevcut fiyatın ALTINDA olmalı
+                # Eğer fiyat zaten aktivasyon seviyesinin altına inmişse → activationPrice koyma (anında aktif)
+                if current_price > 0 and act < current_price:
+                    tsl_params["activationPrice"] = act
+                    log.info(f"  📍 {sym}: Aktivasyon henüz tetiklenmedi ({act:.{pp}f} > {current_price:.{pp}f})")
+                else:
+                    log.info(f"  ⚡ {sym}: Fiyat aktivasyonu geçti ({current_price:.{pp}f} < {act:.{pp}f}) → TSL anında aktif")
                 if hedge:
                     tsl_params["positionSide"] = "SHORT"
                 else:
@@ -558,15 +587,13 @@ class PumpSnifferBot:
 
     async def _cleanup_orphan_orders(self):
         """
-        Pozisyonu kapanmış ama active_trades kaydı kalan coinleri temizler.
-        Sembol bazlı çalışır — global fetch_open_orders KULLANMAZ (rate-limit sorununu önler).
-        GÜVENLİK: fetch_positions boş/None dönerse HİÇBİR ŞEY silmez (yanlış pozitif koruması).
+        İKİ YÖNLÜ ORFAN TEMİZLİK:
+        A) active_trades'de var ama Binance'te pozisyon yok → kaydı sil
+        B) _seen_symbols'de var, Binance'te emri var ama pozisyon yok → emirleri iptal et
+        GÜVENLİK: fetch_positions boş/None dönerse HİÇBİR ŞEY silmez.
         """
         try:
-            # Binance'teki tüm açık pozisyonları al
             positions = await self._safe_call(self.exchange.fetch_positions)
-
-            # GÜVENLİK ZIRHI: Pozisyon listesi boş veya None ise çık — ağ hatası olabilir
             if not positions:
                 log.debug("⏩ Orfan temizlik atlandı: fetch_positions boş döndü")
                 return
@@ -576,39 +603,42 @@ class PumpSnifferBot:
                 if abs(float(p.get("contracts") or 0)) > 0:
                     live_symbols.add(p.get("symbol"))
 
-            # active_trades'deki kayıtları Binance pozisyonlarıyla karşılaştır
-            # Her sempol için ayrıca tek tek doğrula (false-positive önlemi)
-            orphan_symbols = []
+            # ── A) active_trades'de var ama pozisyon yok → sil ────────────────
             for sym in list(self.active_trades):
                 if sym in live_symbols:
                     continue
-                # İkinci kontrol: sembol bazlı fetch_positions ile doğrula
                 try:
-                    sym_pos = await self._safe_call(
-                        self.exchange.fetch_positions, [sym]
-                    )
+                    sym_pos = await self._safe_call(self.exchange.fetch_positions, [sym])
                     has_pos = any(
                         abs(float(p.get("contracts") or 0)) > 0
-                        for p in (sym_pos or [])
-                        if p.get("symbol") == sym
+                        for p in (sym_pos or []) if p.get("symbol") == sym
                     )
                     if not has_pos:
-                        orphan_symbols.append(sym)
+                        await self._cancel_algo_orders(sym, retry=False)
+                        del self.active_trades[sym]
+                        log.info(f"  🗑️  {sym} active_trades'den silindi (pozisyon yok)")
                 except Exception:
-                    pass  # Hata varsa bu sembolü silme — güvenli taraf
+                    pass
 
-            if not orphan_symbols:
-                return
+            # ── B) seen_symbols'de var, emri var ama pozisyon yok → emirleri iptal ──
+            self._seen_symbols.update(self.active_trades.keys())
+            check_syms = self._seen_symbols - live_symbols - set(self.active_trades.keys())
+            for sym in list(check_syms):
+                try:
+                    orders = await self._safe_call(
+                        self.exchange.fetch_open_orders, sym,
+                        params={"stop": True}
+                    )
+                    if orders:
+                        log.info(f"  🧹 {sym}: Pozisyon yok ama {len(orders)} emir var → iptal")
+                        await self._cancel_algo_orders(sym, retry=False)
+                        self._seen_symbols.discard(sym)
+                except Exception:
+                    pass
 
-            log.info(f"🧹 Orfan kayıt temizliği: {orphan_symbols}")
-            for sym in orphan_symbols:
-                # Sembol bazlı emir iptali (rate-limit safe)
-                await self._cancel_algo_orders(sym, retry=False)
-                del self.active_trades[sym]
-                log.info(f"  🗑️  {sym} active_trades'den silindi (Binance'te pozisyon yok)")
             self._save_state()
         except Exception as e:
-            log.warning(f"⚠️ Orfan kayıt temizlik hatası: {e}")
+            log.warning(f"⚠️ Orfan temizlik hatası: {e}")
 
     # ─────────────────────────────────────────────────────────────────
     # 2.0.1  API ANAHTAR YÜKLEME
