@@ -728,76 +728,97 @@ class PumpSnifferBot:
 
     async def _cancel_algo_orders(self, symbol: str, retry: bool = True) -> bool:
         """
-        SNIPER CANCEL v5.0 — 3 turda doğrulamalı temizlik.
-        Her tur: toplu iptal → raw endpoint → ID bazlı tek tek → algo → doğrulama.
-        Doğrulama geçerse erken çıkar; geçmezse tekrar dener.
-        closePosition=True / GTE_GTC emirleri de kapsanır.
+        FULL ANNIHILATION v6.0
+        Binance Futures'ta emirler 2 sekmeye ayrılır:
+          - Basic      : Limit/Market → standart fetch_open_orders görür
+          - Conditional: STOP_MARKET, TAKE_PROFIT_MARKET (closePosition=True)
+                         → standart çağrılar GÖRMEZ, explicit params gerektirir
+
+        Aşama 1 → Basic sekme temizliği   (cancel_all_orders)
+        Aşama 2 → Conditional sekme imhası (STOP_MARKET + TAKE_PROFIT_MARKET
+                                              explicit fetch → ID bazı tek tek)
+        Aşama 3 → Ultimate Nuke             (fapiPrivateDeleteAllOpenOrders)
+        Doğrulama → Temiz mi? Değilse retry döngüsü (max 3 tur)
         """
-        raw_sym = symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT")
         max_rounds = 3 if retry else 1
+
+        # Market ID'sini al (BTCUSDT formatı, slash'siz)
+        try:
+            mkt_id = self.exchange.market(symbol)["id"]
+        except Exception:
+            mkt_id = symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT")
+
+        async def _cancel_orders_by_type(order_type: str) -> int:
+            """Conditional emirleri tip bazında çekip ID ile sil. Kaç emir silindi döndür."""
+            count = 0
+            try:
+                orders = await self._safe_call(
+                    self.exchange.fetch_open_orders, symbol,
+                    params={"type": order_type, "stop": True}
+                )
+                for order in (orders or []):
+                    oid = order.get("id")
+                    if not oid:
+                        continue
+                    try:
+                        await self._safe_call(
+                            self.exchange.cancel_order, oid, symbol,
+                            params={"type": order_type, "stop": True}
+                        )
+                        count += 1
+                        log.debug(f"  🟥 Conditional iptal: {symbol} {order_type} ID:{oid}")
+                    except Exception as e:
+                        if "-2011" not in str(e):  # Zaten iptal
+                            log.debug(f"  ⚠️ ID iptal hatası ({oid}): {e}")
+            except Exception as e:
+                log.debug(f"  ⚠️ fetch {order_type} hatası ({symbol}): {e}")
+            return count
 
         for round_num in range(1, max_rounds + 1):
             cleaned = 0
 
-            # ── ADIM 1: Standart toplu iptal ──────────────────────────────────
+            # ── Aşama 1: Basic sekme — standart cancel_all ────────────────────
             try:
-                await self.exchange.cancel_all_orders(symbol)
+                await self._safe_call(self.exchange.cancel_all_orders, symbol)
             except Exception:
                 pass
 
-            # ── ADIM 2: Raw Binance endpoint (GTE / closePosition emirler) ────
-            try:
-                await self.exchange.fapiPrivateDeleteAllOpenOrders({"symbol": raw_sym})
-            except Exception:
-                pass
-
-            # Binance matching engine'in işlemi kaydetmesi için bekle
-            await asyncio.sleep(0.6)
-
-            # ── ADIM 3: ID bazlı sniper — kalan emirleri tek tek vur ──────────
-            try:
-                open_orders = await self.exchange.fetch_open_orders(symbol)
-                for order in open_orders:
-                    oid = order.get("id")
-                    if not oid:
-                        continue
-                    for _attempt in range(2):  # Her emir için 2 deneme
-                        try:
-                            await self.exchange.cancel_order(oid, symbol)
-                            cleaned += 1
-                            log.debug(f"  🎯 Sniper cancel: {symbol} ID:{oid} iptal edildi")
-                            break
-                        except Exception as e:
-                            if "-2011" in str(e):  # Zaten iptal edilmiş
-                                break
-                            await asyncio.sleep(0.3)
-            except Exception as e:
-                log.debug(f"  ⚠️ fetch_open_orders ({symbol}): {e}")
-
-            # ── ADIM 4: Algo emirler (TWAP / VP) ─────────────────────────────
-            try:
-                open_algo = await self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": raw_sym})
-                algo_list = open_algo.get("orders", []) if isinstance(open_algo, dict) else []
-                if algo_list:
-                    await self.exchange.fapiPrivateDeleteAlgoOpenOrders({"symbol": raw_sym})
-                    cleaned += len(algo_list)
-            except Exception:
-                pass
+            # ── Aşama 2: Conditional sekme — explicit tip bazı imha ──────────
+            cleaned += await _cancel_orders_by_type("STOP_MARKET")
+            cleaned += await _cancel_orders_by_type("TAKE_PROFIT_MARKET")
+            cleaned += await _cancel_orders_by_type("STOP")           # bazı ccxt versiyonları
+            cleaned += await _cancel_orders_by_type("TAKE_PROFIT")    # dönüşüm alternatifleri
 
             await asyncio.sleep(0.4)
 
-            # ── ADIM 5: Doğrulama — hala emir var mı? ────────────────────────
+            # ── Aşama 3: Ultimate Nuke — arka kapı fapi toplu silme ────────
             try:
-                remaining = await self.exchange.fetch_open_orders(symbol)
+                await self.exchange.fapiPrivateDeleteAllOpenOrders({"symbol": mkt_id})
+            except Exception:
+                pass
+
+            await asyncio.sleep(0.5)  # Binance matching engine sync
+
+            # ── Doğrulama — Basic + Conditional birlikte kontrol ────────────
+            try:
+                remaining_basic = await self._safe_call(
+                    self.exchange.fetch_open_orders, symbol
+                ) or []
+                remaining_stop  = await self._safe_call(
+                    self.exchange.fetch_open_orders, symbol,
+                    params={"type": "STOP_MARKET", "stop": True}
+                ) or []
+                remaining = remaining_basic + remaining_stop
+
                 if not remaining:
                     if cleaned > 0:
-                        log.info(f"  🗑️ Sniper v5 OK: {symbol} ({cleaned} emir temizlendi)")
+                        log.info(f"  🗑️ Full Annihilation OK: {symbol} ({cleaned} emir temizlendi)")
                     return True
-                # Hala emir var — sonraki tura geç
+
                 if round_num < max_rounds:
                     log.warning(
                         f"  ⚠️ {symbol}: {len(remaining)} emir hala açık — "
-                        f"tur {round_num}/{max_rounds}, tekrar deneniyor..."
+                        f"tur {round_num}/{max_rounds}, tekrar..."
                     )
                     await asyncio.sleep(1.0)
                 else:
@@ -806,8 +827,7 @@ class PumpSnifferBot:
                         f"RAM SL devreye girecek."
                     )
             except Exception:
-                # Doğrulama yapılamadı, iyimser devam et
-                return True
+                return True  # Doğrulama yapılamadı, iyimser devam
 
         return False
 
