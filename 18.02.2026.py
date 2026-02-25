@@ -818,63 +818,66 @@ class PumpSnifferBot:
         Doküman Madde 2: Algo emirleri (STOP_MARKET/TAKE_PROFIT_MARKET) standart
         fetch_open_orders / cancel_all_orders ile görünmez. Ayrı API gerektirir.
         Bu metod HEM standart HEM algo stop emirlerini temizler.
-        
-        v3.9.5: Standart open orders + algo orders birlikte temizlenir.
-                 -4130 hatasının kök nedeni (orphan standart stop) çözüldü.
+
+        v4.0 — SNIPER CANCEL: Her emir ID'ye göre tek tek zorla iptal edilir.
+               cancel_all toplu silip geçemediği GTE/closePosition emirlerini çözer.
         """
         raw_sym = symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT")
-        max_attempts = 2 if retry else 1
         cleaned = 0
-        
-        for attempt in range(max_attempts):
-            try:
-                # 1) Standart açık emirleri temizle (STOP_MARKET dahil)
-                try:
-                    open_orders = await self._safe_call(
-                        self.exchange.fetch_open_orders, symbol
-                    )
-                    for order in open_orders:
-                        otype = (order.get("type") or "").upper()
-                        if otype in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"):
-                            try:
-                                await self._safe_call(
-                                    self.exchange.cancel_order, order["id"], symbol
-                                )
-                                cleaned += 1
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
 
-                # 2) Algo emirleri temizle
-                try:
-                    open_algo = await self._safe_call(
-                        self.exchange.fapiPrivateGetOpenAlgoOrders,
-                        {"symbol": raw_sym}
-                    )
-                    orders = open_algo.get("orders", []) if isinstance(open_algo, dict) else []
-                    if orders:
-                        await self._safe_call(
-                            self.exchange.fapiPrivateDeleteAlgoOpenOrders,
-                            {"symbol": raw_sym}
-                        )
-                        cleaned += len(orders)
-                except Exception:
-                    pass
+        # ── ADIM 1: Toplu cancel (limit emirleri ve normal stop'lar için) ──────
+        try:
+            await self.exchange.cancel_all_orders(symbol)
+        except Exception:
+            pass
 
-                if cleaned > 0:
-                    log.info(f"  🗑️ Emirler temizlendi: {symbol} ({cleaned} emir)")
-                    await asyncio.sleep(0.2)  # Binance senkronizasyonu için
-                return True
-            except Exception as e:
-                if attempt < max_attempts - 1:
-                    log.debug(f"  Algo temizlik deneme {attempt+1} başarısız ({symbol}), tekrar deneniyor...")
-                    await asyncio.sleep(0.3)
+        # ── ADIM 2: Raw Binance endpoint — tüm açık emirleri sil ──────────────
+        try:
+            await self._safe_call(
+                self.exchange.fapiPrivateDeleteAllOpenOrders,
+                {"symbol": raw_sym}
+            )
+        except Exception:
+            pass
+
+        # ── ADIM 3: SNIPER — açık kalan emirleri çek, ID bazlı tek tek iptal ──
+        try:
+            open_orders = await self.exchange.fetch_open_orders(symbol)
+            for order in open_orders:
+                order_id = order.get("id")
+                if not order_id:
                     continue
-                else:
-                    log.warning(f"  ⚠️ Algo temizlik hatası ({symbol}): {e}")
-                    return False
-        return False
+                try:
+                    await self.exchange.cancel_order(order_id, symbol)
+                    cleaned += 1
+                    log.debug(f"  🎯 Sniper cancel: {symbol} emir {order_id} iptal edildi")
+                except Exception as e:
+                    log.debug(f"  ⚠️ Sniper cancel başarısız ({order_id}): {e}")
+        except Exception as e:
+            log.debug(f"  ⚠️ fetch_open_orders hatası ({symbol}): {e}")
+
+        # ── ADIM 4: Algo emirleri temizle ─────────────────────────────────────
+        try:
+            open_algo = await self._safe_call(
+                self.exchange.fapiPrivateGetOpenAlgoOrders,
+                {"symbol": raw_sym}
+            )
+            algo_orders = open_algo.get("orders", []) if isinstance(open_algo, dict) else []
+            if algo_orders:
+                await self._safe_call(
+                    self.exchange.fapiPrivateDeleteAlgoOpenOrders,
+                    {"symbol": raw_sym}
+                )
+                cleaned += len(algo_orders)
+        except Exception:
+            pass
+
+        # ── ADIM 5: Binance matching engine'e senkronizasyon süresi ──────────
+        await asyncio.sleep(0.5)
+
+        if cleaned > 0:
+            log.info(f"  🗑️ Sniper temizlik tamamlandı: {symbol} ({cleaned} emir iptal)")
+        return True
 
     async def open_short(self, symbol: str, entry_price: float,
                          pump_item: WatchlistItem, equity: float,
