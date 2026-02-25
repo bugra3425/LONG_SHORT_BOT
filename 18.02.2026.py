@@ -470,6 +470,86 @@ class PumpSnifferBot:
         except Exception as e:
             log.warning(f"⚠️ Binance recovery hatası: {e}")
 
+    async def _startup_tsl_check(self):
+        """
+        Bot başlangıcında tüm aktif pozisyonları tara.
+        Binance'te TRAILING_STOP_MARKET emri OLMAYAN pozisyonlara otomatik TSL koy.
+        İnternetten veya eski kodla açılan pozisyonları korur.
+        """
+        if not self.active_trades:
+            return
+        log.info(f"🔍 Startup TSL Kontrolü: {len(self.active_trades)} aktif pozisyon kontrol ediliyor...")
+        hedge = await self._detect_position_mode()
+        for sym, trade in list(self.active_trades.items()):
+            try:
+                # Binance'te bu sembol için TSL var mı?
+                open_orders = await self._safe_call(
+                    self.exchange.fetch_open_orders, sym,
+                    params={"stop": True}
+                )
+                has_tsl = any(
+                    "TRAILING" in (
+                        o.get("type") or
+                        o.get("info", {}).get("origType") or ""
+                    ).upper()
+                    for o in (open_orders or [])
+                )
+                if has_tsl:
+                    trade.tsl_placed = True
+                    log.info(f"  ✅ {sym}: Binance'te TSL mevcut")
+                    continue
+                # TSL yok → pozisyon miktarını al
+                positions = await self._safe_call(self.exchange.fetch_positions, [sym])
+                qty = 0.0
+                for p in (positions or []):
+                    if p.get("symbol") == sym:
+                        qty = abs(float(p.get("contracts", 0)))
+                        break
+                if qty <= 0:
+                    log.debug(f"  ⏩ {sym}: Açık pozisyon yok, atlandı")
+                    continue
+                mkt = self.exchange.markets.get(sym, {})
+                pp  = get_digits(mkt.get("precision", {}).get("price"))
+                act = round(
+                    trade.entry_price * (1 - Config.TSL_ACTIVATION_DROP_PCT / 100.0), pp
+                )
+                if act >= trade.entry_price:
+                    log.error(f"  ❌ {sym}: TSL aktivasyon yönü hatalı, atlandı")
+                    continue
+                tsl_params = {
+                    "activationPrice": act,
+                    "callbackRate"   : Config.TSL_TRAIL_PCT,
+                    "workingType"    : "MARK_PRICE",
+                }
+                if hedge:
+                    tsl_params["positionSide"] = "SHORT"
+                else:
+                    tsl_params["reduceOnly"] = True
+                await self.exchange.create_order(
+                    symbol=sym,
+                    type="TRAILING_STOP_MARKET",
+                    side="buy",
+                    amount=qty,
+                    price=None,
+                    params=tsl_params
+                )
+                trade.tsl_placed = True
+                log.info(
+                    f"  🔧 {sym}: TSL EKLENdİ — "
+                    f"aktivasyon={act:.{pp}f} | callback=%{Config.TSL_TRAIL_PCT}"
+                )
+                try:
+                    notifier.send(
+                        f"🔧 Başlatışta TSL Eklendi\n🪙 {sym}\n"
+                        f"🎯 Aktivasyon: {act:.{pp}f}\n"
+                        f"📏 Callback: %{Config.TSL_TRAIL_PCT}"
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                log.warning(f"  ⚠️ {sym} startup TSL hatası: {e}")
+        self._save_state()
+
     # ─────────────────────────────────────────────────────────────────
     # 2.0.1  API ANAHTAR YÜKLEME
     # ─────────────────────────────────────────────────────────────────
@@ -1886,6 +1966,7 @@ class PumpSnifferBot:
         # Restart koruması: kayıtlı state'i yükle, sonra Binance'ten doğrula
         self._load_state()
         await self._recover_from_binance()
+        await self._startup_tsl_check()
         tf           = Config.TIMEFRAME.upper()
         next_close   = self._next_close_utc()
         prep_offset  = self._prep_offset_sec()
