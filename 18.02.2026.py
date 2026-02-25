@@ -238,6 +238,7 @@ class TradeRecord:
     reentry_count: int = 0          # Bu pump döngüsünde kaçıncı giriş
     consec_green_loss: int = 0      # Zararda arka arkaya yeşil mum sayacı (2'de çık)
     _last_checked_ts: str = ""       # Son değerlendirilen kapanmış mum timestamp'i (aynı mumu tekrar saymamak için)
+    _last_binance_sl: float = 0.0     # Son başarıyla Binance'e gönderilen SL fiyatı
 
     # Backtest ekstra alanları
     pump_pct: float = 0.0
@@ -1073,6 +1074,10 @@ class PumpSnifferBot:
                         }
                     )
                     log.info(f"  🔄 SL GÜNCELLENDI (Binance, deneme {attempt}): {symbol}  → {sl_rounded:.{price_prec}f}")
+                    # Başarılı SL'i kaydet — gereksiz tekrar güncellemeyi önle
+                    trade = self.active_trades.get(symbol)
+                    if trade:
+                        trade._last_binance_sl = sl_rounded
                     return  # Başarılı
                 except ccxt.ExchangeError as e:
                     err_str = str(e)
@@ -1217,12 +1222,16 @@ class PumpSnifferBot:
                         log.info(f"  📉 TSL GÜNCELLE: {sym}  "
                                  f"YeniLow: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
 
-                # ── KURAL 3: SL değiştiyse → ÖNCE temizle, SONRA güncelle ─────
+                # ── KURAL 3: SL değiştiyse → Binance'e güncelle (minimum %0.3 fark eşiği) ──
                 if trade.stop_loss != old_sl:
-                    await self._cancel_algo_orders(sym, retry=True)
-                    await asyncio.sleep(0.2)
-                    await self._update_binance_sl(sym, trade.stop_loss)
-                    self._save_state()
+                    self._save_state()  # RAM değişikliğini hemen kaydet
+                    # Binance'e sadece anlamlı fark olduğunda gönder
+                    last_b_sl = trade._last_binance_sl or trade.initial_stop_loss
+                    sl_change_pct = abs(trade.stop_loss - last_b_sl) / last_b_sl * 100.0 if last_b_sl > 0 else 999
+                    if sl_change_pct >= 0.3:
+                        await self._update_binance_sl(sym, trade.stop_loss)
+                    else:
+                        log.debug(f"  ⏳ {sym}: SL farkı %{sl_change_pct:.2f} < %0.3 — Binance güncelleme atlandı")
 
                 # ── Stage 3: SL-Hit Kontrolü — current_price >= SL → kapat ────
                 if current_price >= trade.stop_loss:
