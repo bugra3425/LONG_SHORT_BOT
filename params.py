@@ -1,135 +1,63 @@
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║          PUMP & DUMP REVERSION BOT — PARAMETRE DOSYASI              ║
-# ║          Bu dosyayı değiştir → git push → Northflank otomatik       ║
-# ║          rebuild yapar ve yeni ayarlarla canlıya başlar.            ║
+# ║          PUMP & DUMP REVERSION BOT — HIZLI TEST PARAMETRELERİ        ║
+# ║  DİKKAT: Bu ayarlar SADECE risk motorunu (BE, TSL, SL) test etmek    ║
+# ║  içindir. Gerçek trade için kullanmayınız!                           ║
 # ╚══════════════════════════════════════════════════════════════════════╝
-#
-# ❗ Northflank workflow:
-#    1. Bu dosyada değerleri değiştir
-#    2. git add params.py && git commit -m "params: ..." && git push
-#    3. Northflank otomatik rebuild → yeni parametrelerle bot başlar
-#
-# ❗ Test ipucu (daha sık sinyal için):
-#    TIMEFRAME = "1h"         # 4h yerine 1h (4× daha fazla bar)
-#    PUMP_MIN_PCT = 20.0      # Pump eşiğini düşür (daha fazla sinyal)
-#    PUMP_WINDOW_CANDLES = 6  # 1h'de 6 mum = 6 saat pencere
-# ═══════════════════════════════════════════════════════════════════════
 
 # ──────────────────────────────────────────────────────────────────────
-#  BÖLÜM 1 — ZAMAN DİLİMİ
+#  BÖLÜM 1 — ZAMAN DİLİMİ (Hiper-Aktif Mod)
 # ──────────────────────────────────────────────────────────────────────
 
-TIMEFRAME = "4h"
-# Desteklenen değerler: "15m" | "30m" | "1h" | "2h" | "4h"
-# ⚠ Backtest'te hızlı test: "1h" ile 4× daha fazla bar → 4× daha fazla sinyal
-# ⚠ Canlı botta: piyasa kapanış mumunu bekler (4h = 4 saatte 1 bar)
+TIMEFRAME = "5m"
 
 # ──────────────────────────────────────────────────────────────────────
-#  BÖLÜM 2 — PUMP TESPİT KOŞULLARİ (Module 1 — Radar)
+#  BÖLÜM 2 — PUMP TESPİT KOŞULLARI (Mikro Pump)
 # ──────────────────────────────────────────────────────────────────────
 
-PUMP_MIN_PCT = 30.0
-# Pump penceresi boyunca minimum kazanç yüzdesi (window[0].low → son kapanış)
-# Örnek: 30 → son 6 mumda dip'ten kapanışa %30+ çıkış olmalı
-# Daha az sinyal istiyorsan artır (35, 40), fazla sinyal istiyorsan düşür (20, 25)
-
+PUMP_MIN_PCT = 1.5
 PUMP_WINDOW_CANDLES = 6
-# Kaç mumun geçmişine bakılır? (4h × 6 = 24 saat)
-# Kısa TF kullanıyorsan da 6 bırakabilirsin (1h × 6 = 6 saat pencere)
-
-PUMP_MIN_GREEN_COUNT = 4
-# 6 mumun kaçı yeşil olmalı? (min 4 → steady climb)
-# Agresif test için 3'e indirebilirsin
-
-PUMP_CANDLE_BODY_MIN_PCT = 5.0
-# Yeşil mum gövdesi minimum yüzdesi (cılız fitilli mumları eliyor)
-# Önerilen aralık: 3.0 – 8.0
-
-TOP_N_GAINERS = 10
-# Scannerdan kaç coin watchlist'e girer? (en yüksek pump % olanlar)
-
-MIN_VOLUME_USDT = 10_000_000.0
-# Pump penceresi toplam hacim limiti (USDT)
-# Likitsiz coinleri elemek için — test için 1_000_000 yapabilirsin
+PUMP_MIN_GREEN_COUNT = 3
+PUMP_CANDLE_BODY_MIN_PCT = 0.1
+TOP_N_GAINERS = 15
+MIN_VOLUME_USDT = 500_000.0
 
 # ──────────────────────────────────────────────────────────────────────
-#  BÖLÜM 3 — GİRİŞ TETİKLEYİCİ KOŞULLARİ (Module 2 — Trigger)
+#  BÖLÜM 3 — GİRİŞ TETİKLEYİCİ KOŞULLARI (Anında Giriş)
 # ──────────────────────────────────────────────────────────────────────
 
-ENTRY_RED_BODY_MIN_PCT = 4.0
-# Giriş mumunun kırmızı gövdesi minimum yüzdesi
-# SHORT girilecek mum güçlü bir kırmızı mum olmalı (zayıf doji girilmez)
-
-PRE_CANDLE_GREEN_BODY_MAX_PCT = 30.0
-# Giriş mumundan HEMEN ÖNCE gelen yeşil mumun gövdesi max yüzdesi
-# Eğer önceki mum tek başına %30+ çıktıysa → ANTI-ROCKET, giriş yok
-
-ANTI_ROCKET_SINGLE_CANDLE_PCT = 30.0
-# Tetikleyiciden önceki tek mumun "anti-rocket" eşiği
-
-GREEN_LOSS_SINGLE_BODY_PCT = 10.0
-# Açık SHORT'ta zararda iken gelen yeşil mumun gövdesi >= bu değerse → hemen çık
-# Daha erken çık istiyorsan: 7.0 | Daha geç: 15.0
+ENTRY_RED_BODY_MIN_PCT = 0.1
+PRE_CANDLE_GREEN_BODY_MAX_PCT = 5.0
+ANTI_ROCKET_SINGLE_CANDLE_PCT = 5.0
+GREEN_LOSS_SINGLE_BODY_PCT = 0.8
 
 # ──────────────────────────────────────────────────────────────────────
-#  BÖLÜM 4 — STOP-LOSS VE TRAILING STOP (Module 3 — Trade Management)
+#  BÖLÜM 4 — STOP-LOSS VE TRAILING STOP (Genişletilmiş İzleme Makası)
 # ──────────────────────────────────────────────────────────────────────
 
-SL_ABOVE_ENTRY_PCT = 15.0
-# İLK Stop-Loss: Giriş fiyatının kaç % üstü?
-# entry × (1 + SL_ABOVE_ENTRY_PCT/100)
-# Daha dar SL: 10.0 | Daha geniş SL: 20.0
+SL_ABOVE_ENTRY_PCT = 2.5
+# İLK Stop-Loss: Girişin %2.5 üstü. 
 
-BREAKEVEN_DROP_PCT = 7.0
-# Stage 1 — Breakeven: Fiyat entry'den %X aşağı inince SL → entry'e çekilir
+BREAKEVEN_DROP_PCT = 1.5
+# Stage 1 — Breakeven: Fiyat %1.5 kâra (düşüşe) geçtiği an SL hemen giriş fiyatına çekilsin.
 
-TSL_ACTIVATION_DROP_PCT = 7.0
-# Stage 2 — TSL Aktivasyonu: Fiyat %X aşağı inince Trailing Stop devreye girer
+TSL_ACTIVATION_DROP_PCT = 3.0
+# Stage 2 — TSL Aktivasyonu: Fiyat %3.0 kâra ulaştığında ana takip motoru devreye girsin.
 
-TSL_TRAIL_PCT = 4.0
-# TSL mesafesi: SL = lowest_low × (1 + TSL_TRAIL_PCT/100)
-# Dar trailing: 2.0 | Geniş trailing: 6.0
+TSL_TRAIL_PCT = 2.0
+# TSL Mesafesi: Fiyat en düşük seviyesindeyken %2 gerisinden (yukarısından) takip etsin.
 
 # ──────────────────────────────────────────────────────────────────────
 #  BÖLÜM 5 — RİSK YÖNETİMİ
 # ──────────────────────────────────────────────────────────────────────
 
-LEVERAGE = 3
-# Kaldıraç (Binance Futures)
-# ⚠ Dikkat: 5+ kaldıraç ciddi likidite riski taşır
-
+LEVERAGE = 1
 MAX_ACTIVE_TRADES = 5
-# Aynı anda maksimum açık pozisyon sayısı
-
-RISK_PER_TRADE_PCT = 2.0
-# Her trade için öz-varlığın (equity) yüzde kaçı riske atılır?
-# %2 → 1000$ sermayede 20$ risk/trade
+RISK_PER_TRADE_PCT = 0.5
 
 # ──────────────────────────────────────────────────────────────────────
-#  BÖLÜM 6 — TARAMA ARALIKLARI (Canlı Bot)
+#  BÖLÜM 6 — TARAMA ARALIKLARI (Saniye Bazlı Hız)
 # ──────────────────────────────────────────────────────────────────────
 
-SCAN_INTERVAL_SEC = 600
-# Universe tarama aralığı (saniye). Kaç saniyede bir tüm Binance futures taranır?
-
-WATCHLIST_CHECK_INTERVAL_SEC = 60
-# Watchlist sinyal kontrol aralığı (saniye).
-
+SCAN_INTERVAL_SEC = 60
+WATCHLIST_CHECK_INTERVAL_SEC = 15
 MANAGER_INTERVAL_SEC = 5
-# Açık trade yönetim döngüsü (saniye). SL, TSL, BE kontrolleri.
-
-# ──────────────────────────────────────────────────────────────────────
-#  BÖLÜM 7 — BACKTEST ÖZEL AYARLARI
-# ──────────────────────────────────────────────────────────────────────
-
-BACKTEST_DAYS = 31
-# Backtest kaç günlük geçmiş veri üzerinde çalışır?
-
-BACKTEST_INITIAL_CAPITAL = 1000.0
-# Backtest başlangıç sermayesi (USDT)
-
-BACKTEST_SYMBOLS = [
-    # Hızlı backtest (seçenek 2) için kullanılan semboller
-    "TRB/USDT", "GAS/USDT", "CYBER/USDT", "LOOM/USDT",
-    "YGG/USDT", "VANRY/USDT", "ORDI/USDT", "BIGTIME/USDT",
-]
