@@ -34,17 +34,36 @@ GREEN_LOSS_SINGLE_BODY_PCT = 0.8
 #  BÖLÜM 4 — STOP-LOSS VE TRAILING STOP (Genişletilmiş İzleme Makası)
 # ──────────────────────────────────────────────────────────────────────
 
-SL_ABOVE_ENTRY_PCT = 2.5
-# İLK Stop-Loss: Girişin %2.5 üstü. 
+# Timeframe başına TSL profil tablosu.
+# TIMEFRAME değişkenini değiştirmek yeterli — tüm değerler otomatik güncellenir.
+_TSL_PROFILES = {
+    "5m": {
+        "SL_ABOVE_ENTRY_PCT":      2.5,   # Giriş üstü ilk SL
+        "BREAKEVEN_DROP_PCT":      1.5,   # Breakeven tetik düşüş %
+        "TSL_ACTIVATION_DROP_PCT": 3.0,   # TSL devreye girme düşüş %
+        "TSL_TRAIL_PCT":           2.0,   # TSL trailing mesafesi %
+    },
+    "4h": {
+        "SL_ABOVE_ENTRY_PCT":      5.0,
+        "BREAKEVEN_DROP_PCT":      4.0,
+        "TSL_ACTIVATION_DROP_PCT": 8.0,
+        "TSL_TRAIL_PCT":           4.0,
+    },
+}
 
-BREAKEVEN_DROP_PCT = 1.5
-# Stage 1 — Breakeven: Fiyat %1.5 kâra (düşüşe) geçtiği an SL hemen giriş fiyatına çekilsin.
+_active_profile = _TSL_PROFILES.get(TIMEFRAME, _TSL_PROFILES["5m"])
 
-TSL_ACTIVATION_DROP_PCT = 3.0
-# Stage 2 — TSL Aktivasyonu: Fiyat %3.0 kâra ulaştığında ana takip motoru devreye girsin.
+SL_ABOVE_ENTRY_PCT      = _active_profile["SL_ABOVE_ENTRY_PCT"]
+# İLK Stop-Loss: Girişin üstünde başlangıç SL.
 
-TSL_TRAIL_PCT = 2.0
-# TSL Mesafesi: Fiyat en düşük seviyesindeyken %2 gerisinden (yukarısından) takip etsin.
+BREAKEVEN_DROP_PCT      = _active_profile["BREAKEVEN_DROP_PCT"]
+# Stage 1 — Breakeven: Fiyat bu kadar %kâra geçtiğinde SL hemen giriş fiyatına çekilsin.
+
+TSL_ACTIVATION_DROP_PCT = _active_profile["TSL_ACTIVATION_DROP_PCT"]
+# Stage 2 — TSL Aktivasyonu: Fiyat bu kadar %kâra ulaştığında trailing motor devreye girsin.
+
+TSL_TRAIL_PCT           = _active_profile["TSL_TRAIL_PCT"]
+# TSL Mesafesi: Fiyat en düşük seviyesindeyken bu % gerisinden takip etsin.
 
 # ──────────────────────────────────────────────────────────────────────
 #  BÖLÜM 5 — RİSK YÖNETİMİ

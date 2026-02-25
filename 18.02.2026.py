@@ -1299,8 +1299,10 @@ class PumpSnifferBot:
         Stage 1 — Breakeven  : %{BREAKEVEN_DROP_PCT} düşüşte SL = entry
         Stage 2 — TSL Aktif  : %{TSL_ACTIVATION_DROP_PCT} düşüşte Trailing Stop devreye girer
         Stage 3 — SL Kontrol : current_price >= SL → fiziksel market close
+        Stage 4 — Yeşil Mum  : Zararda yeşil mum kapanışı → GREEN-10 / 2xGREEN-LOSS çıkışı
 
-        Tüm stajlar TICKER (mark/last price) kullanır — OHLCV çekmez.
+        Stage 1-3: TICKER (mark/last price) kullanır — OHLCV çekmez.
+        Stage 4  : Sadece bu aşamada OHLCV çeker (kapanmış mum kontrolü).
         """
         closed = []
 
@@ -1355,16 +1357,11 @@ class PumpSnifferBot:
                         log.info(f"  📉 TSL GÜNCELLE: {sym}  "
                                  f"YeniLow: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
 
-                # ── KURAL 3: SL değiştiyse → Binance'e güncelle (minimum %0.3 fark eşiği) ──
+                # ── KURAL 3: SL değiştiyse → ÖNCE temizle, SONRA güncelle ─────
                 if trade.stop_loss != old_sl:
-                    self._save_state()  # RAM değişikliğini hemen kaydet
-                    # Binance'e sadece anlamlı fark olduğunda gönder
-                    last_b_sl = trade._last_binance_sl or trade.initial_stop_loss
-                    sl_change_pct = abs(trade.stop_loss - last_b_sl) / last_b_sl * 100.0 if last_b_sl > 0 else 999
-                    if sl_change_pct >= 0.3:
-                        await self._update_binance_sl(sym, trade.stop_loss)
-                    else:
-                        log.debug(f"  ⏳ {sym}: SL farkı %{sl_change_pct:.2f} < %0.3 — Binance güncelleme atlandı")
+                    await self._cancel_algo_orders(sym, retry=True)
+                    await asyncio.sleep(0.2)
+                    await self._update_binance_sl(sym, trade.stop_loss)
 
                 # ── Stage 3: SL-Hit Kontrolü — current_price >= SL → kapat ────
                 if current_price >= trade.stop_loss:
@@ -1419,6 +1416,82 @@ class PumpSnifferBot:
                         notifier.notify_trade_close(sym, reason, trade.pnl_pct, trade.pnl_usdt)
                     except Exception:
                         pass
+                    continue  # Stage 3'te kapandı — Stage 4'e geçme
+
+                # ── KURAL 4: Stage 4 İZOLASYONU — Sadece burada OHLCV çek ─────
+                # İşlem hâlâ açık → kapanmış mum kontrolü için minimal OHLCV
+                try:
+                    df_raw = await self.fetch_ohlcv(sym, Config.TIMEFRAME, limit=3)
+                    if df_raw.empty:
+                        continue
+                    df_closed = self._remove_live_candle(df_raw, Config.TIMEFRAME)
+                    if df_closed.empty:
+                        continue
+                    closed_candle = df_closed.iloc[-1]
+                except Exception:
+                    continue
+
+                # Aynı kapanmış mumu tekrar saymamak için timestamp kontrolü
+                candle_ts = str(df_closed.index[-1])
+                if candle_ts == trade._last_checked_ts:
+                    pass  # Bu mum zaten değerlendirildi
+                elif closed_candle["close"] > closed_candle["open"] and closed_candle["close"] > trade.entry_price:
+                    trade._last_checked_ts = candle_ts
+                    green_body_pct = (closed_candle["close"] - closed_candle["open"]) / closed_candle["open"] * 100.0
+
+                    # Zararda tek yeşil mum gövdesi >= %GREEN_LOSS_SINGLE_BODY_PCT → anında kapat
+                    if green_body_pct >= Config.GREEN_LOSS_SINGLE_BODY_PCT:
+                        exit_p  = closed_candle["close"]
+                        pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
+                        pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
+                        trade.exit_time   = datetime.now(timezone.utc).isoformat()
+                        trade.exit_price  = exit_p
+                        trade.exit_reason = "GREEN-10"
+                        trade.pnl_pct     = round(pnl_pct * 100, 4)
+                        trade.pnl_usdt    = round(pnl_usd, 2)
+                        self.trade_history.append(trade)
+                        closed.append(sym)
+                        self._post_exit_price[sym] = exit_p
+                        self._new_push[sym] = False
+                        # Önce temizle, sonra kapat
+                        await self._cancel_algo_orders(sym, retry=True)
+                        await asyncio.sleep(0.2)
+                        await self._market_close_position(sym)
+                        log.info(f"  🟠 GREEN-10: {sym}  Gövde: %{green_body_pct:.1f}  Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT")
+                        try:
+                            notifier.notify_trade_close(sym, "GREEN-10", trade.pnl_pct, trade.pnl_usdt)
+                        except Exception:
+                            pass
+                        continue
+
+                    # Küçük zararda yeşil → sayacı artır, 2'de kapat
+                    trade.consec_green_loss += 1
+                    if trade.consec_green_loss >= 2:
+                        exit_p  = closed_candle["close"]
+                        pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
+                        pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
+                        trade.exit_time   = datetime.now(timezone.utc).isoformat()
+                        trade.exit_price  = exit_p
+                        trade.exit_reason = "2xGREEN-LOSS"
+                        trade.pnl_pct     = round(pnl_pct * 100, 4)
+                        trade.pnl_usdt    = round(pnl_usd, 2)
+                        self.trade_history.append(trade)
+                        closed.append(sym)
+                        self._post_exit_price[sym] = exit_p
+                        self._new_push[sym] = False
+                        # Önce temizle, sonra kapat
+                        await self._cancel_algo_orders(sym, retry=True)
+                        await asyncio.sleep(0.2)
+                        await self._market_close_position(sym)
+                        log.info(f"  🟠 2xGREEN-LOSS: {sym}  Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT")
+                        try:
+                            notifier.notify_trade_close(sym, "2xGREEN-LOSS", trade.pnl_pct, trade.pnl_usdt)
+                        except Exception:
+                            pass
+                        continue
+                else:
+                    trade._last_checked_ts = candle_ts
+                    trade.consec_green_loss = 0  # Kırmızı veya kârda yeşil → sayacı sıfırla
 
             except Exception as e:
                 log.error(f"  Trade yönetim hatası ({sym}): {e}")
