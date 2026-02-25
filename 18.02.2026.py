@@ -1014,63 +1014,46 @@ class PumpSnifferBot:
         Binance'teki mevcut STOP_MARKET emrini iptal edip yeni fiyattan tekrar oluşturur.
         BE / TSL tetiklendiğinde çağrılır — SL sadece RAM'de değil, borsada da güncellenir.
 
-        v3.8: -4130 hatası için retry mekanizması eklendi.
+        v3.10: -4130 için 3-turlu retry loop + cancel_all_orders agresif temizlik.
+               -4509 için pozisyon yoksa trade kaydı otomatik temizlenir.
         """
         try:
             await self._safe_call(self.exchange.load_markets)
             market     = self.exchange.markets.get(symbol, {})
             price_prec = get_digits(market.get("precision", {}).get("price"))
             sl_rounded = round(new_sl_price, price_prec)
+            raw_sym    = symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT")
 
             # 0) Pozisyon gerçekten açık mı? (-4509 koruması)
             try:
-                positions = await self._safe_call(self.exchange.fetch_positions, [symbol])
+                positions    = await self._safe_call(self.exchange.fetch_positions, [symbol])
                 has_position = any(
                     abs(float(p.get("contracts", 0))) > 0
                     for p in (positions or [])
                     if p.get("symbol") == symbol
                 )
             except Exception:
-                has_position = True  # Kontrol başarısız → devam et, borsa reddederse yakalar
+                has_position = True  # Kontrol başarısız → devam et
 
             if not has_position:
-                log.warning(f"  ⚠️ {symbol}: Binance'te açık pozisyon yok — SL güncelleme atlandı, trade kapatılıyor.")
+                log.warning(f"  ⚠️ {symbol}: Binance'te açık pozisyon yok — SL atlandı, trade temizleniyor.")
                 await self._cancel_algo_orders(symbol, retry=False)
-                trade = self.active_trades.pop(symbol, None)
-                if trade:
-                    trade.exit_time   = datetime.now(timezone.utc).isoformat()
-                    trade.exit_price  = new_sl_price
-                    trade.exit_reason = "POZISYON-YOK"
-                    self.trade_history.append(trade)
-                    self._save_state()
-                    try:
-                        notifier.send(f"ℹ️ {symbol} pozisyonu dışarıdan kapanmış — bot kaydı temizlendi.")
-                    except Exception:
-                        pass
+                self._close_trade_locally(symbol, new_sl_price, "POZISYON-YOK")
                 return
 
-            # 1) Eski stop emrini sil
-            await self._cancel_algo_orders(symbol, retry=True)
-            await asyncio.sleep(0.2)  # Binance senkronizasyon bekleme
+            # 1) Cancel + Place loop (max 3 deneme, -4130 için)
+            last_err = None
+            for attempt in range(1, 4):
+                # Agresif temizlik: önce tekil, sonra cancel_all
+                await self._cancel_algo_orders(symbol, retry=True)
+                try:
+                    await self._safe_call(self.exchange.cancel_all_orders, symbol)
+                except Exception:
+                    pass
+                wait = 0.5 * attempt  # 0.5s → 1.0s → 1.5s
+                await asyncio.sleep(wait)
 
-            # 2) Yeni stop emrini koy
-            try:
-                await self._safe_call(
-                    self.exchange.create_order,
-                    symbol, "stop_market", "buy", None,
-                    params={
-                        "stopPrice"    : sl_rounded,
-                        "closePosition": True,
-                        "workingType"  : "MARK_PRICE",
-                    }
-                )
-                log.info(f"  🔄 SL GÜNCELLENDI (Binance): {symbol}  → {sl_rounded:.{price_prec}f}")
-            except ccxt.ExchangeError as e:
-                if "-4130" in str(e):
-                    # -4130: Orphan stop hala duruyor — force temizle ve tekrar dene
-                    log.warning(f"  ⚠️ -4130 yakalandı, orphan cleanup + retry: {symbol}")
-                    await self._cancel_algo_orders(symbol, retry=True)
-                    await asyncio.sleep(0.3)
+                try:
                     await self._safe_call(
                         self.exchange.create_order,
                         symbol, "stop_market", "buy", None,
@@ -1080,22 +1063,40 @@ class PumpSnifferBot:
                             "workingType"  : "MARK_PRICE",
                         }
                     )
-                    log.info(f"  🔄 SL GÜNCELLENDI (retry sonrası): {symbol}  → {sl_rounded:.{price_prec}f}")
-                elif "-4509" in str(e):
-                    # -4509: Pozisyon yok — trade kaydını temizle
-                    log.warning(f"  ⚠️ -4509: {symbol} pozisyonu yok, trade kaydı temizleniyor.")
-                    await self._cancel_algo_orders(symbol, retry=False)
-                    trade = self.active_trades.pop(symbol, None)
-                    if trade:
-                        trade.exit_time   = datetime.now(timezone.utc).isoformat()
-                        trade.exit_price  = new_sl_price
-                        trade.exit_reason = "POZISYON-YOK"
-                        self.trade_history.append(trade)
-                        self._save_state()
-                else:
-                    raise
+                    log.info(f"  🔄 SL GÜNCELLENDI (Binance, deneme {attempt}): {symbol}  → {sl_rounded:.{price_prec}f}")
+                    return  # Başarılı — çık
+                except ccxt.ExchangeError as e:
+                    err_str = str(e)
+                    if "-4130" in err_str:
+                        log.warning(f"  ⚠️ -4130 deneme {attempt}/3 ({symbol}) — tekrar temizleyip bekleniyor…")
+                        last_err = e
+                        continue  # Tekrar dene
+                    elif "-4509" in err_str:
+                        log.warning(f"  ⚠️ -4509: {symbol} pozisyonu yok, trade kaydı temizleniyor.")
+                        self._close_trade_locally(symbol, new_sl_price, "POZISYON-YOK")
+                        return
+                    else:
+                        raise
+
+            # 3 deneme de başarısız
+            log.error(f"  ❌ SL güncellenemedi 3 denemede ({symbol}): {last_err}")
+
         except Exception as e:
             log.error(f"  ❌ Binance SL güncelleme hatası ({symbol}): {e}")
+
+    def _close_trade_locally(self, symbol: str, exit_price: float, reason: str):
+        """RAM + JSON'dan trade kaydını kapat (Binance'te pozisyon yoksa kullanılır)."""
+        trade = self.active_trades.pop(symbol, None)
+        if trade:
+            trade.exit_time   = datetime.now(timezone.utc).isoformat()
+            trade.exit_price  = exit_price
+            trade.exit_reason = reason
+            self.trade_history.append(trade)
+            self._save_state()
+            try:
+                notifier.send(f"ℹ️ {symbol} pozisyonu dışarıdan kapanmış ({reason}) — bot kaydı temizlendi.")
+            except Exception:
+                pass
 
     # ─────────────────────────────────────────────────────────────────
     # 2.3.2  FİZİKSEL MARKET CLOSE YARDIMCISI
