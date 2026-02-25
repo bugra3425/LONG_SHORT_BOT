@@ -898,13 +898,26 @@ class PumpSnifferBot:
             amount_prec = get_digits(market.get("precision", {}).get("amount"))
 
             qty = round(pos["qty"], amount_prec)
+            calculated_qty = qty  # Log için orijinal değeri sakla
 
             # ── maxQty kontrolü (-4005 fix) ───────────────────────────
             limits  = market.get("limits", {})
-            max_qty = (limits.get("amount") or {}).get("max")
-            if max_qty and qty > float(max_qty):
-                log.warning(f"  ⚠️ {symbol}: qty={qty} > maxQty={max_qty} — kırpılıyor.")
-                qty = round(float(max_qty), amount_prec)
+            # limits.amount.max  → genel pozisyon limiti
+            # limits.market.max  → market emrine özel limit (daha kısıtlayıcı olabilir)
+            max_qty_amount = (limits.get("amount") or {}).get("max")
+            max_qty_market = (limits.get("market")  or {}).get("max")
+            caps = [v for v in [max_qty_amount, max_qty_market] if v is not None]
+            max_qty = float(min(caps)) if caps else None
+
+            if max_qty and qty > max_qty:
+                qty = round(max_qty, amount_prec)
+
+            log.info(
+                f"  🧮 {symbol} Emir Hazırlığı: "
+                f"Hesaplanan={calculated_qty}  "
+                f"MaxLimit={max_qty if max_qty else 'limitsiz'}  "
+                f"Girilecek={qty}"
+            )
 
             if qty * entry_price < Config.MIN_NOTIONAL_USDT:
                 log.warning(f"  ⚠️ {symbol}: Notional < {Config.MIN_NOTIONAL_USDT} USDT — atlanıyor.")
