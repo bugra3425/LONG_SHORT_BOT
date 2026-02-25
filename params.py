@@ -44,10 +44,10 @@ _TSL_PROFILES = {
         "TSL_TRAIL_PCT":           2.0,   # TSL trailing mesafesi %
     },
     "4h": {
-        "SL_ABOVE_ENTRY_PCT":      5.0,
-        "BREAKEVEN_DROP_PCT":      4.0,
-        "TSL_ACTIVATION_DROP_PCT": 8.0,
-        "TSL_TRAIL_PCT":           4.0,
+        "SL_ABOVE_ENTRY_PCT":      15.0,  # 4H mumlarda pump'ın son iğnesine dayanabilmek için geniş ilk SL
+        "BREAKEVEN_DROP_PCT":      5.0,   # %5 kâra geçince sermayeyi koru (SL -> Entry)
+        "TSL_ACTIVATION_DROP_PCT": 8.0,   # %8 kârda iz süren stopu uyandır
+        "TSL_TRAIL_PCT":           4.0,   # (callbackRate) En düşük fiyattan %4 yukarı sekince kârı al
     },
 }
 
