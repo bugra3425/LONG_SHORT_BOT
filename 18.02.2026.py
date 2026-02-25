@@ -918,6 +918,7 @@ class PumpSnifferBot:
         )
 
         # ── Exchange emir gönderimi ───────────────────────────────────
+        order_placed = False  # Market emri gerçekten açıldı mı?
         try:
             await self._safe_call(self.exchange.load_markets)
             market      = self.exchange.markets.get(symbol, {})
@@ -925,6 +926,13 @@ class PumpSnifferBot:
             amount_prec = get_digits(market.get("precision", {}).get("amount"))
 
             qty = round(pos["qty"], amount_prec)
+
+            # ── maxQty kontrolü (-4005 fix) ───────────────────────────
+            limits      = market.get("limits", {})
+            max_qty     = (limits.get("amount") or {}).get("max")
+            if max_qty and qty > float(max_qty):
+                log.warning(f"  ⚠️ {symbol}: qty={qty} > maxQty={max_qty} — kırpılıyor.")
+                qty = round(float(max_qty), amount_prec)
 
             if qty * entry_price < Config.MIN_NOTIONAL_USDT:
                 log.warning(f"  ⚠️ {symbol}: Notional < {Config.MIN_NOTIONAL_USDT} USDT — atlanıyor.")
@@ -948,6 +956,7 @@ class PumpSnifferBot:
                 symbol, "market", "sell", qty,
                 params={"reduceOnly": False}
             )
+            order_placed = True  # Market emri başarıyla gönderildi
             log.info(f"  📤 Market SHORT emir: {order.get('id', 'N/A')}")
 
             await self._cancel_algo_orders(symbol)
@@ -982,8 +991,10 @@ class PumpSnifferBot:
         except Exception as e:
             log.error(f"  ❌ Emir gönderilemedi ({symbol}): {e}")
 
-        # Market emri ID'si varsa, SL hata verse bile bu işlemi takip etmeliyiz
-        # Aksi halde bot sonsuz döngüde sürekli yeni market emri açar
+        # Market emri gönderilmediyse active_trades'e ekleme — hayalet trade önlemi
+        if not order_placed:
+            log.warning(f"  ⛔ {symbol}: Market emri başarısız — trade kaydı oluşturulmadı.")
+            return None
         self.active_trades[symbol] = trade
         self._save_state()
         log.info(
