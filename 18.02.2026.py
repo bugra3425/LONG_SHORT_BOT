@@ -243,6 +243,7 @@ class TradeRecord:
     consec_green_loss: int = 0      # Zararda arka arkaya yeşil mum sayacı (2'de çık)
     _last_checked_ts: str = ""       # Son değerlendirilen kapanmış mum timestamp'i (aynı mumu tekrar saymamak için)
     _last_binance_sl: float = 0.0     # Son başarıyla Binance'e gönderilen SL fiyatı
+    tsl_placed: bool = False              # Binance'te TRAILING_STOP_MARKET emri onaylandı mı?
 
     # Backtest ekstra alanları
     pump_pct: float = 0.0
@@ -1112,27 +1113,36 @@ class PumpSnifferBot:
                 entry_price * (1 - Config.TSL_ACTIVATION_DROP_PCT / 100.0),
                 price_prec
             )
-            tsl_params = {
-                "activationPrice": activation_price,
-                "callbackRate"   : Config.TSL_TRAIL_PCT,
-                "reduceOnly"     : True,   # closePosition yerine reduceOnly kullan (-4136 fix)
-                "workingType"    : "MARK_PRICE",
-            }
-            if hedge:
-                tsl_params["positionSide"] = "SHORT"
-                del tsl_params["reduceOnly"]  # Hedge Mode'da reduceOnly gönderilemez
-            try:
-                await self._safe_call(
-                    self.exchange.create_order,
-                    symbol, "trailing_stop_market", "buy", qty,
-                    params=tsl_params
+            # SHORT için aktivasyon MUTLAKA entry'nin ALTINDA olmalı
+            if activation_price >= entry_price:
+                log.error(
+                    f"  ❌ TSL aktivasyon yönü HATALI ({symbol}): "
+                    f"activation={activation_price} >= entry={entry_price} — TSL koyulmadı!"
                 )
-                log.info(
-                    f"  🎯 TRAILING STOP koyuldu: aktivasyon={activation_price:.{price_prec}f}  "
-                    f"callbackRate=%{Config.TSL_TRAIL_PCT}"
-                )
-            except Exception as e:
-                log.warning(f"  ⚠️ Trailing Stop emir hatası ({symbol}): {e}")
+                activation_price = None  # Aşağıda skip edilecek
+            if activation_price is not None:
+                tsl_params = {
+                    "activationPrice": activation_price,
+                    "callbackRate"   : Config.TSL_TRAIL_PCT,
+                    "reduceOnly"     : True,   # closePosition yerine reduceOnly kullan (-4136 fix)
+                    "workingType"    : "MARK_PRICE",
+                }
+                if hedge:
+                    tsl_params["positionSide"] = "SHORT"
+                    del tsl_params["reduceOnly"]  # Hedge Mode'da reduceOnly gönderilemez
+                try:
+                    await self._safe_call(
+                        self.exchange.create_order,
+                        symbol, "trailing_stop_market", "buy", qty,
+                        params=tsl_params
+                    )
+                    trade.tsl_placed = True  # Repair bloğunun tekrar kontrol etmemesi için
+                    log.info(
+                        f"  🎯 TRAILING STOP koyuldu: aktivasyon={activation_price:.{price_prec}f}  "
+                        f"callbackRate=%{Config.TSL_TRAIL_PCT}"
+                    )
+                except Exception as e:
+                    log.warning(f"  ⚠️ Trailing Stop emir hatası ({symbol}): {e}")
 
         except Exception as e:
             log.error(f"  ❌ Emir gönderilemedi ({symbol}): {e}")
@@ -1380,6 +1390,75 @@ class PumpSnifferBot:
                 if current_price is None:
                     continue
                 current_price = float(current_price)
+
+                # ── TSL Repair: Eksik TRAILING_STOP_MARKET otomatik onar ──────
+                # Eski kodla açılan pozisyonlarda TSL hiç koyulmamış olabilir.
+                # tsl_placed = False iken Binance'te TSL var mı kontrol et;
+                # yoksa aktivasyon fiyatını hesaplayıp yeni emir koy.
+                if not trade.tsl_placed:
+                    try:
+                        _open_orders = await self._safe_call(
+                            self.exchange.fetch_open_orders, sym,
+                            params={"stop": True}
+                        )
+                        _has_tsl = any(
+                            "TRAILING" in (
+                                o.get("type") or
+                                o.get("info", {}).get("origType") or ""
+                            ).upper()
+                            for o in (_open_orders or [])
+                        )
+                        if _has_tsl:
+                            trade.tsl_placed = True
+                            log.debug(f"  ✅ TSL mevcut ({sym})")
+                        else:
+                            # TSL yok → pozisyon miktarını al ve koy
+                            _positions = await self._safe_call(
+                                self.exchange.fetch_positions, [sym]
+                            )
+                            _qty = 0.0
+                            for _p in (_positions or []):
+                                if _p.get("symbol") == sym:
+                                    _qty = abs(float(_p.get("contracts", 0)))
+                                    break
+                            if _qty > 0:
+                                _mkt  = self.exchange.markets.get(sym, {})
+                                _pp   = get_digits(_mkt.get("precision", {}).get("price"))
+                                _act  = round(
+                                    trade.entry_price * (1 - Config.TSL_ACTIVATION_DROP_PCT / 100.0),
+                                    _pp
+                                )
+                                _hedge = await self._detect_position_mode()
+                                _tp = {
+                                    "activationPrice": _act,
+                                    "callbackRate"   : Config.TSL_TRAIL_PCT,
+                                    "reduceOnly"     : True,
+                                    "workingType"    : "MARK_PRICE",
+                                }
+                                if _hedge:
+                                    _tp["positionSide"] = "SHORT"
+                                    del _tp["reduceOnly"]
+                                await self._safe_call(
+                                    self.exchange.create_order,
+                                    sym, "trailing_stop_market", "buy", _qty,
+                                    params=_tp
+                                )
+                                trade.tsl_placed = True
+                                log.info(
+                                    f"  🔧 TSL ONARILDI ({sym}): "
+                                    f"aktivasyon={_act:.{_pp}f}  "
+                                    f"callback=%{Config.TSL_TRAIL_PCT}"
+                                )
+                                try:
+                                    notifier.send(
+                                        f"🔧 TSL EKLENDİ\n🪙 {sym}\n"
+                                        f"🎯 Aktivasyon: {_act:.{_pp}f}\n"
+                                        f"📏 Callback: %{Config.TSL_TRAIL_PCT}"
+                                    )
+                                except Exception:
+                                    pass
+                    except Exception as _tsl_err:
+                        log.debug(f"  ⚠️ TSL repair hatası ({sym}): {_tsl_err}")
 
                 # ── Stage 1: Breakeven — düşüş >= %BREAKEVEN_DROP_PCT ─────────
                 # Sadece STOP_MARKET entry'e çekilir. TRAILING_STOP_MARKET'e dokunulmaz.
