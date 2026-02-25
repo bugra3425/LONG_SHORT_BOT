@@ -119,7 +119,11 @@ def _make_binance_exchange(extra_opts: dict = None, demo: bool = False) -> ccxt.
     opts = {
         "enableRateLimit": True,
         "timeout": 30_000,
-        "options": {"defaultType": "future"},
+        "options": {
+            "defaultType": "future",
+            "adjustForTimeDifference": True,  # Clock drift fix (-1000 unknown error)
+            "recvWindow": 10000,              # Binance zaman toleransını 10sn'ye çıkar
+        },
     }
     if extra_opts:
         opts.update(extra_opts)
