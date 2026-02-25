@@ -560,20 +560,42 @@ class PumpSnifferBot:
         """
         Pozisyonu kapanmış ama active_trades kaydı kalan coinleri temizler.
         Sembol bazlı çalışır — global fetch_open_orders KULLANMAZ (rate-limit sorununu önler).
+        GÜVENLİK: fetch_positions boş/None dönerse HİÇBİR ŞEY silmez (yanlış pozitif koruması).
         """
         try:
             # Binance'teki tüm açık pozisyonları al
             positions = await self._safe_call(self.exchange.fetch_positions)
+
+            # GÜVENLİK ZIRHI: Pozisyon listesi boş veya None ise çık — ağ hatası olabilir
+            if not positions:
+                log.debug("⏩ Orfan temizlik atlandı: fetch_positions boş döndü")
+                return
+
             live_symbols = set()
-            for p in (positions or []):
+            for p in positions:
                 if abs(float(p.get("contracts") or 0)) > 0:
                     live_symbols.add(p.get("symbol"))
 
             # active_trades'deki kayıtları Binance pozisyonlarıyla karşılaştır
-            orphan_symbols = [
-                sym for sym in list(self.active_trades)
-                if sym not in live_symbols
-            ]
+            # Her sempol için ayrıca tek tek doğrula (false-positive önlemi)
+            orphan_symbols = []
+            for sym in list(self.active_trades):
+                if sym in live_symbols:
+                    continue
+                # İkinci kontrol: sembol bazlı fetch_positions ile doğrula
+                try:
+                    sym_pos = await self._safe_call(
+                        self.exchange.fetch_positions, [sym]
+                    )
+                    has_pos = any(
+                        abs(float(p.get("contracts") or 0)) > 0
+                        for p in (sym_pos or [])
+                        if p.get("symbol") == sym
+                    )
+                    if not has_pos:
+                        orphan_symbols.append(sym)
+                except Exception:
+                    pass  # Hata varsa bu sembolü silme — güvenli taraf
 
             if not orphan_symbols:
                 return
