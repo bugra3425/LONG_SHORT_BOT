@@ -947,7 +947,11 @@ class PumpSnifferBot:
                 sl_params   = {"stopPrice": None, "closePosition": True,
                                "workingType": "MARK_PRICE"}
 
-            # ── Market emri — 3'lü Akıllı Retry ─────────────────────────────
+            # ── Market emri — 3'lü Geniş Ağ Retry (Catch-All) ─────────────────
+            # Mantık: SADECE kalıcı hatalarda iptal et,
+            #         bunlar dışındaki HER HATADA (-1000, timeout, CCXT obje vb.) tekrar dene.
+            FATAL_ERRORS = ["-4005", "-2019", "-1102", "-4003",
+                            "insufficient", "margin", "max quantity", "balance"]
             max_retries = 3
             order = None
             for attempt in range(max_retries):
@@ -962,18 +966,19 @@ class PumpSnifferBot:
                              f"(deneme {attempt+1}/{max_retries})")
                     break  # Başarılı — döngüden çık
                 except Exception as e:
-                    err = str(e)
-                    if "-1000" in err or "Rate limit" in err.lower() or "429" in err:
+                    err = str(e).lower()
+                    if any(f.lower() in err for f in FATAL_ERRORS):
+                        # Kalıcı hata — tekrar denemek işe yaramaz
+                        log.error(f"  ❌ Kalıcı/Kritik emir hatası ({symbol}): {e}")
+                        break
+                    else:
+                        # Anlık hata (-1000, timeout, CCXT obje, ağ vs.) — tekrar dene
                         log.warning(
-                            f"  ⚠️ Binance sunucu hatası — "
-                            f"deneme {attempt+1}/{max_retries} ({symbol}): {e}"
+                            f"  ⚠️ Anlık hata/gecikme — "
+                            f"deneme {attempt+1}/{max_retries} ({symbol}): {str(e)[:80]}"
                         )
                         if attempt < max_retries - 1:
                             await asyncio.sleep(1.5 * (attempt + 1))  # 1.5s, 3s
-                    else:
-                        # Kritik hata (bakıye yetersiz, precision hatası vb.) — hemen iptal
-                        log.error(f"  ❌ Kritik emir hatası ({symbol}): {e}")
-                        break
 
             if not order_placed:
                 raise RuntimeError(f"Market emri {max_retries} denemede başarısız")
