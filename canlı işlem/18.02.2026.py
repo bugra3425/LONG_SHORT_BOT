@@ -934,13 +934,36 @@ class PumpSnifferBot:
                 sl_params   = {"stopPrice": None, "closePosition": True,
                                "workingType": "MARK_PRICE"}
 
-            order = await self._safe_call(
-                self.exchange.create_order,
-                symbol, "market", "sell", qty,
-                params=open_params
-            )
-            order_placed = True  # Market emri başarıyla gönderildi
-            log.info(f"  📤 Market SHORT emir: {order.get('id', 'N/A')}")
+            # ── Market emri — 3'lü Akıllı Retry ─────────────────────────────
+            max_retries = 3
+            order = None
+            for attempt in range(max_retries):
+                try:
+                    order = await self._safe_call(
+                        self.exchange.create_order,
+                        symbol, "market", "sell", qty,
+                        params=open_params
+                    )
+                    order_placed = True
+                    log.info(f"  📤 Market SHORT emir: {order.get('id', 'N/A')} "
+                             f"(deneme {attempt+1}/{max_retries})")
+                    break  # Başarılı — döngüden çık
+                except Exception as e:
+                    err = str(e)
+                    if "-1000" in err or "Rate limit" in err.lower() or "429" in err:
+                        log.warning(
+                            f"  ⚠️ Binance sunucu hatası — "
+                            f"deneme {attempt+1}/{max_retries} ({symbol}): {e}"
+                        )
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(1.5 * (attempt + 1))  # 1.5s, 3s
+                    else:
+                        # Kritik hata (bakıye yetersiz, precision hatası vb.) — hemen iptal
+                        log.error(f"  ❌ Kritik emir hatası ({symbol}): {e}")
+                        break
+
+            if not order_placed:
+                raise RuntimeError(f"Market emri {max_retries} denemede başarısız")
 
             await self._cancel_algo_orders(symbol)
 
