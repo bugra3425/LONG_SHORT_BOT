@@ -36,8 +36,8 @@ GREEN_LOSS_SINGLE_BODY_PCT = 3.0
 
 SL_ABOVE_ENTRY_PCT      = 2.5   # Giriş üstü ilk SL
 BREAKEVEN_DROP_PCT      = 1.5   # %1.5 kâra geçince SL → Entry
-TSL_ACTIVATION_DROP_PCT = 2.0   # %2 kâra ulaşıldığında trailing stop aktif
-TSL_TRAIL_PCT           = 1.0   # En düşük fiyattan %1 yukarı sekince kârı al
+TSL_ACTIVATION_DROP_PCT = 1.0   # Giriş fiyatının %1 altında TSL aktif (her zaman giriş altında)
+TSL_TRAIL_PCT           = 0.5   # En düşük fiyattan %0.5 yukarı sekince pozisyonu kapat
 
 # ──────────────────────────────────────────────────────────────────────
 #  BÖLÜM 5 — RİSK YÖNETİMİ
