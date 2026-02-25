@@ -345,6 +345,7 @@ class PumpSnifferBot:
             extra_opts={"apiKey": api_key, "secret": api_secret},
             demo=Config.DEMO_MODE,   # demo.binance.com veya canlı borsa
         )
+        self.exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
         self.watchlist: Dict[str, WatchlistItem] = {}
         self.active_trades: Dict[str, TradeRecord] = {}
         self.trade_history: List[TradeRecord] = []
@@ -552,10 +553,8 @@ class PumpSnifferBot:
 
     async def _cleanup_orphan_orders(self):
         """
-        Pozisyonu kapanmış ama açık emri kalan coinleri temizler.
-        Örnek: TSL ve SL aynı anda açıkken TSL tetiklenince SL orfan kalır.
-        Her çağrıda Binance'teki open orders ile aktif pozisyon listesini karşılaştırır,
-        pozisyon olmayan sembollerin tüm emirlerini iptal eder.
+        Pozisyonu kapanmış ama active_trades kaydı kalan coinleri temizler.
+        Sembol bazlı çalışır — global fetch_open_orders KULLANMAZ (rate-limit sorununu önler).
         """
         try:
             # Binance'teki tüm açık pozisyonları al
@@ -565,41 +564,24 @@ class PumpSnifferBot:
                 if abs(float(p.get("contracts") or 0)) > 0:
                     live_symbols.add(p.get("symbol"))
 
-            # Tüm açık emirleri al (standard + conditional)
-            open_orders = []
-            try:
-                open_orders = await self._safe_call(self.exchange.fetch_open_orders)
-            except Exception:
-                pass
-            try:
-                cond = await self._safe_call(
-                    self.exchange.fetch_open_orders,
-                    params={"stop": True}
-                )
-                open_orders = (open_orders or []) + (cond or [])
-            except Exception:
-                pass
-
-            # Hangi semboller orfan?
-            orphan_symbols = set()
-            for o in (open_orders or []):
-                sym = o.get("symbol")
-                if sym and sym not in live_symbols:
-                    orphan_symbols.add(sym)
+            # active_trades'deki kayıtları Binance pozisyonlarıyla karşılaştır
+            orphan_symbols = [
+                sym for sym in list(self.active_trades)
+                if sym not in live_symbols
+            ]
 
             if not orphan_symbols:
                 return
 
-            log.info(f"🧹 Orfan emir temizliği: {orphan_symbols}")
+            log.info(f"🧹 Orfan kayıt temizliği: {orphan_symbols}")
             for sym in orphan_symbols:
-                await self._cancel_algo_orders(sym, retry=True)
-                # active_trades'den de sil (hayalet kayıt)
-                if sym in self.active_trades:
-                    del self.active_trades[sym]
-                    log.info(f"  🗑️  {sym} active_trades'den silindi (pozisyon yok)")
+                # Sembol bazlı emir iptali (rate-limit safe)
+                await self._cancel_algo_orders(sym, retry=False)
+                del self.active_trades[sym]
+                log.info(f"  🗑️  {sym} active_trades'den silindi (Binance'te pozisyon yok)")
             self._save_state()
         except Exception as e:
-            log.warning(f"⚠️ Orfan emir temizlik hatası: {e}")
+            log.warning(f"⚠️ Orfan kayıt temizlik hatası: {e}")
 
     # ─────────────────────────────────────────────────────────────────
     # 2.0.1  API ANAHTAR YÜKLEME
@@ -2148,6 +2130,7 @@ class Backtester:
     async def _init_exchange(self):
         """Public data için exchange bağlantısı (API key gereksiz)."""
         self.exchange = _make_binance_exchange()
+        self.exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
 
     async def _fetch_historical(self, symbol: str) -> pd.DataFrame:
         """
