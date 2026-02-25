@@ -24,7 +24,8 @@ import sys
 import time
 import os
 from datetime import datetime, timedelta, timezone
-from dataclasses import dataclass, field
+import dataclasses
+from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Tuple
 
 # ── 3. Parti Kütüphaneler ───────────────────────────────────────────────
@@ -346,6 +347,97 @@ class PumpSnifferBot:
         self._processed_signals: Dict[str, str] = {}    # sym → son sinyal timestamp (Tekilleştirme)
         self._prep_done: Optional[asyncio.Event] = None  # PREP→TRIGGER senkronizasyonu
         self.running = False
+
+    # ─────────────────────────────────────────────────────────────────
+    # 2.0.0  KALICI DURUM YÖNETİMİ  (restart koruması)
+    # ─────────────────────────────────────────────────────────────────
+    STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "active_trades.json")
+
+    def _save_state(self):
+        """active_trades'i JSON dosyasına yaz (bot restart koruması)."""
+        try:
+            import json
+            data = {sym: asdict(trade) for sym, trade in self.active_trades.items()}
+            with open(self.STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            log.debug(f"💾 Durum kaydedildi: {len(data)} açık trade")
+        except Exception as e:
+            log.warning(f"⚠️ Durum kaydedilemedi: {e}")
+
+    def _load_state(self):
+        """JSON dosyasından active_trades'i geri yükle."""
+        import json
+        try:
+            if not os.path.exists(self.STATE_FILE):
+                return
+            with open(self.STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            valid_fields = {f.name for f in dataclasses.fields(TradeRecord)}
+            count = 0
+            for sym, td in data.items():
+                try:
+                    td_filtered = {k: v for k, v in td.items() if k in valid_fields}
+                    self.active_trades[sym] = TradeRecord(**td_filtered)
+                    count += 1
+                except Exception as ex:
+                    log.warning(f"⚠️ {sym} trade yüklenemedi: {ex}")
+            if count:
+                log.info(f"📂 Kaydedilmiş {count} trade yüklendi: {list(self.active_trades.keys())}")
+        except Exception as e:
+            log.warning(f"⚠️ Durum dosyası okunamadı: {e}")
+
+    async def _recover_from_binance(self):
+        """
+        Binance'teki açık pozisyonları tara.
+        active_trades'de olmayan pozisyonlar için minimal TradeRecord oluştur,
+        böylece TSL/BE/SL yönetimi bot restart sonrasında da devam eder.
+        """
+        try:
+            await self._safe_call(self.exchange.load_markets)
+            positions = await self._safe_call(self.exchange.fetch_positions)
+            if not positions:
+                return
+            recovered = 0
+            for pos in positions:
+                contracts = float(pos.get("contracts") or 0)
+                if contracts <= 0:
+                    continue
+                sym = pos.get("symbol")
+                if not sym or sym in self.active_trades:
+                    continue
+                entry_price = float(
+                    pos.get("entryPrice") or
+                    pos.get("info", {}).get("entryPrice", 0) or 0
+                )
+                if entry_price <= 0:
+                    continue
+                side_raw  = (pos.get("side") or "short").upper()
+                side      = "SHORT" if side_raw in ("SHORT", "SELL") else "LONG"
+                leverage  = int(float(pos.get("leverage") or Config.LEVERAGE))
+                notional  = abs(float(pos.get("notional") or contracts * entry_price))
+                margin    = notional / leverage if leverage > 0 else notional
+                sl_price  = entry_price * (1 + Config.SL_ABOVE_ENTRY_PCT / 100.0)
+                trade = TradeRecord(
+                    symbol=sym,
+                    side=side,
+                    entry_time=datetime.now(timezone.utc).isoformat(),
+                    entry_price=entry_price,
+                    stop_loss=sl_price,
+                    initial_stop_loss=sl_price,
+                    position_size_usdt=margin,
+                    leverage=leverage,
+                )
+                self.active_trades[sym] = trade
+                recovered += 1
+                log.warning(
+                    f"  🔄 Binance pozisyonu kurtarıldı: {sym}  "
+                    f"Giriş: {entry_price}  SL: {sl_price:.6f}"
+                )
+            if recovered:
+                self._save_state()
+                log.info(f"✅ {recovered} pozisyon Binance'ten kurtarıldı → TSL/BE/SL yönetimi devreye alındı")
+        except Exception as e:
+            log.warning(f"⚠️ Binance recovery hatası: {e}")
 
     # ─────────────────────────────────────────────────────────────────
     # 2.0.1  API ANAHTAR YÜKLEME
@@ -889,6 +981,7 @@ class PumpSnifferBot:
         # Market emri ID'si varsa, SL hata verse bile bu işlemi takip etmeliyiz
         # Aksi halde bot sonsuz döngüde sürekli yeni market emri açar
         self.active_trades[symbol] = trade
+        self._save_state()
         log.info(
             f"  ✅ SHORT AÇILDI [{('DEMO 🧪' if Config.DEMO_MODE else 'CANLI ⚠️')}]: {symbol}\n"
             f"     Giriş : {entry_price:.6f}\n"
@@ -1019,10 +1112,8 @@ class PumpSnifferBot:
         Stage 1 — Breakeven  : %{BREAKEVEN_DROP_PCT} düşüşte SL = entry
         Stage 2 — TSL Aktif  : %{TSL_ACTIVATION_DROP_PCT} düşüşte Trailing Stop devreye girer
         Stage 3 — SL Kontrol : current_price >= SL → fiziksel market close
-        Stage 4 — Zararda yeşil mum → fiziksel market close (sadece KAPANMIŞ mumlar)
 
-        Stage 1-3: TICKER (mark/last price) kullanır — OHLCV çekmez.
-        Stage 4  : Sadece bu aşamada OHLCV çeker (kapanmış mum kontrolü).
+        Tüm stajlar TICKER (mark/last price) kullanır — OHLCV çekmez.
         """
         closed = []
 
@@ -1082,6 +1173,7 @@ class PumpSnifferBot:
                     await self._cancel_algo_orders(sym, retry=True)
                     await asyncio.sleep(0.2)
                     await self._update_binance_sl(sym, trade.stop_loss)
+                    self._save_state()
 
                 # ── Stage 3: SL-Hit Kontrolü — current_price >= SL → kapat ────
                 if current_price >= trade.stop_loss:
@@ -1136,88 +1228,14 @@ class PumpSnifferBot:
                         notifier.notify_trade_close(sym, reason, trade.pnl_pct, trade.pnl_usdt)
                     except Exception:
                         pass
-                    continue  # Stage 3'te kapandı — Stage 4'e geçme
-
-                # ── KURAL 4: Stage 4 İZOLASYONU — Sadece burada OHLCV çek ─────
-                # İşlem hâlâ açık → kapanmış mum kontrolü için minimal OHLCV
-                try:
-                    df_raw = await self.fetch_ohlcv(sym, Config.TIMEFRAME, limit=3)
-                    if df_raw.empty:
-                        continue
-                    df_closed = self._remove_live_candle(df_raw, Config.TIMEFRAME)
-                    if df_closed.empty:
-                        continue
-                    closed_candle = df_closed.iloc[-1]
-                except Exception:
-                    continue
-
-                # Aynı kapanmış mumu tekrar saymamak için timestamp kontrolü
-                candle_ts = str(df_closed.index[-1])
-                if candle_ts == trade._last_checked_ts:
-                    pass  # Bu mum zaten değerlendirildi
-                elif closed_candle["close"] > closed_candle["open"] and closed_candle["close"] > trade.entry_price:
-                    trade._last_checked_ts = candle_ts
-                    green_body_pct = (closed_candle["close"] - closed_candle["open"]) / closed_candle["open"] * 100.0
-
-                    # Zararda tek yeşil mum gövdesi >= %10 → anında kapat
-                    if green_body_pct >= Config.GREEN_LOSS_SINGLE_BODY_PCT:
-                        exit_p  = closed_candle["close"]
-                        pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
-                        pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
-                        trade.exit_time   = datetime.now(timezone.utc).isoformat()
-                        trade.exit_price  = exit_p
-                        trade.exit_reason = "GREEN-10"
-                        trade.pnl_pct     = round(pnl_pct * 100, 4)
-                        trade.pnl_usdt    = round(pnl_usd, 2)
-                        self.trade_history.append(trade)
-                        closed.append(sym)
-                        self._post_exit_price[sym] = exit_p
-                        self._new_push[sym] = False
-                        # KURAL 3: Önce temizle, sonra kapat
-                        await self._cancel_algo_orders(sym, retry=True)
-                        await asyncio.sleep(0.2)
-                        await self._market_close_position(sym)
-                        log.info(f"  🟠 GREEN-10: {sym}  Gövde: %{green_body_pct:.1f}  Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT")
-                        try:
-                            notifier.notify_trade_close(sym, "GREEN-10", trade.pnl_pct, trade.pnl_usdt)
-                        except Exception:
-                            pass
-                        continue
-
-                    # Küçük zararda yeşil → sayacı artır, 2'de kapat
-                    trade.consec_green_loss += 1
-                    if trade.consec_green_loss >= 2:
-                        exit_p  = closed_candle["close"]
-                        pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
-                        pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
-                        trade.exit_time   = datetime.now(timezone.utc).isoformat()
-                        trade.exit_price  = exit_p
-                        trade.exit_reason = "2xGREEN-LOSS"
-                        trade.pnl_pct     = round(pnl_pct * 100, 4)
-                        trade.pnl_usdt    = round(pnl_usd, 2)
-                        self.trade_history.append(trade)
-                        closed.append(sym)
-                        self._post_exit_price[sym] = exit_p
-                        self._new_push[sym] = False
-                        # KURAL 3: Önce temizle, sonra kapat
-                        await self._cancel_algo_orders(sym, retry=True)
-                        await asyncio.sleep(0.2)
-                        await self._market_close_position(sym)
-                        log.info(f"  🟠 2xGREEN-LOSS: {sym}  Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT")
-                        try:
-                            notifier.notify_trade_close(sym, "2xGREEN-LOSS", trade.pnl_pct, trade.pnl_usdt)
-                        except Exception:
-                            pass
-                        continue
-                else:
-                    trade._last_checked_ts = candle_ts
-                    trade.consec_green_loss = 0  # Kırmızı veya kârda yeşil → sayacı sıfırla
 
             except Exception as e:
                 log.error(f"  Trade yönetim hatası ({sym}): {e}")
 
         for sym in closed:
             del self.active_trades[sym]
+        if closed:
+            self._save_state()
 
     # ─────────────────────────────────────────────────────────────────
     # 2.4  ZAMAN AYARLI 4H MİMARİSİ  (v3.9)
@@ -1513,6 +1531,9 @@ class PumpSnifferBot:
           GÖREV 3 • manager_loop    : Her 5 saniye → Açık trade yönetimi (TSL/BE/SL)
         """
         self.running = True
+        # Restart koruması: kayıtlı state'i yükle, sonra Binance'ten doğrula
+        self._load_state()
+        await self._recover_from_binance()
         tf           = Config.TIMEFRAME.upper()
         next_close   = self._next_close_utc()
         prep_offset  = self._prep_offset_sec()
