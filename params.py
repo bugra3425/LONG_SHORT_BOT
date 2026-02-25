@@ -40,8 +40,8 @@ _TSL_PROFILES = {
     "5m": {
         "SL_ABOVE_ENTRY_PCT":      2.5,   # Giriş üstü ilk SL
         "BREAKEVEN_DROP_PCT":      1.5,   # Breakeven tetik düşüş %
-        "TSL_ACTIVATION_DROP_PCT": 1.5,   # %1.5 kâra ulaşıldığında TSL'yi uyandır
-        "TSL_TRAIL_PCT":           0.5,   # (callbackRate) En düşük fiyattan %0.5 yukarı sekince kârı al
+        "TSL_ACTIVATION_DROP_PCT": 3.0,   # %3 kâra ulaşıldığında TSL'yi uyandır
+        "TSL_TRAIL_PCT":           2.0,   # (callbackRate) En düşük fiyattan %2 yukarı sekince kârı al
     },
     "4h": {
         "SL_ABOVE_ENTRY_PCT":      15.0,  # 4H mumlarda pump'ın son iğnesine dayanabilmek için geniş ilk SL
