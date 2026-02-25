@@ -1103,6 +1103,36 @@ class PumpSnifferBot:
                 else:
                     raise
 
+            # ── Binance Native TRAILING_STOP_MARKET ─────────────────────────
+            # Binance'in kendi iz-süren stop motoru. Bot artık manuel dip takibi yapmaz.
+            # Aktivasyon: entry × (1 - TSL_ACTIVATION_DROP_PCT/100)
+            # Callback  : TSL_TRAIL_PCT — aktivasyondan sonra en düşük fiyattan bu % yukarı
+            #             sekince pozisyon otomatik kapanır.
+            activation_price = round(
+                entry_price * (1 - Config.TSL_ACTIVATION_DROP_PCT / 100.0),
+                price_prec
+            )
+            tsl_params = {
+                "activationPrice": activation_price,
+                "callbackRate"   : Config.TSL_TRAIL_PCT,
+                "closePosition"  : True,
+                "workingType"    : "MARK_PRICE",
+            }
+            if hedge:
+                tsl_params["positionSide"] = "SHORT"
+            try:
+                await self._safe_call(
+                    self.exchange.create_order,
+                    symbol, "trailing_stop_market", "buy", None,
+                    params=tsl_params
+                )
+                log.info(
+                    f"  🎯 TRAILING STOP koyuldu: aktivasyon={activation_price:.{price_prec}f}  "
+                    f"callbackRate=%{Config.TSL_TRAIL_PCT}"
+                )
+            except Exception as e:
+                log.warning(f"  ⚠️ Trailing Stop emir hatası ({symbol}): {e}")
+
         except Exception as e:
             log.error(f"  ❌ Emir gönderilemedi ({symbol}): {e}")
 
@@ -1116,7 +1146,7 @@ class PumpSnifferBot:
             f"  ✅ SHORT AÇILDI [{('DEMO 🧪' if Config.DEMO_MODE else 'CANLI ⚠️')}]: {symbol}\n"
             f"     Giriş : {entry_price:.6f}\n"
             f"     SL    : {pos['sl']:.6f}  (+{Config.SL_ABOVE_ENTRY_PCT}% giriş üstü)\n"
-            f"     TSL   : %{Config.TSL_ACTIVATION_DROP_PCT} düşüşte aktif → lowest_low × {1 + Config.TSL_TRAIL_PCT/100:.2f}\n"
+            f"     TSL   : aktivasyon=%{Config.TSL_ACTIVATION_DROP_PCT}  callbackRate=%{Config.TSL_TRAIL_PCT}  (Binance native)\n"
             f"     Boyut : {pos['position_size_usdt']:.4f} USDT  "
             f"(x{pos['leverage']} → {pos['notional_usdt']:.4f} notional)"
         )
@@ -1283,22 +1313,54 @@ class PumpSnifferBot:
             log.error(f"  ❌ Market close hatası ({symbol}): {e}")
 
     # ─────────────────────────────────────────────────────────────────
+    # 2.3.2b  SADECE STOP_MARKET İPTAL (TRAILING_STOP_MARKET dokunmaz)
+    # ─────────────────────────────────────────────────────────────────
+
+    async def _cancel_only_stop_market(self, symbol: str):
+        """
+        Binance'teki yalnızca STOP_MARKET emirlerini iptal eder.
+        TRAILING_STOP_MARKET emirlerine kesinlikle dokunmaz.
+        Breakeven aşamasında kullanılır — native TSL'i korumak için.
+        """
+        try:
+            orders = await self._safe_call(
+                self.exchange.fetch_open_orders, symbol,
+                params={"type": "STOP_MARKET", "stop": True}
+            )
+            for order in (orders or []):
+                oid   = order.get("id")
+                otype = (order.get("type") or
+                         order.get("info", {}).get("origType") or "").upper()
+                if not oid or "TRAILING" in otype:
+                    continue  # TRAILING_STOP_MARKET'e dokunma
+                try:
+                    await self._safe_call(
+                        self.exchange.cancel_order, oid, symbol,
+                        params={"type": "STOP_MARKET", "stop": True}
+                    )
+                    log.debug(f"  🟡 BE: STOP_MARKET iptal ({symbol}) ID:{oid}")
+                except Exception as e:
+                    if "-2011" not in str(e):  # Zaten iptal edilmiş → yoksay
+                        log.debug(f"  ⚠️ BE cancel hatası ({oid}): {e}")
+        except Exception as e:
+            log.debug(f"  ⚠️ _cancel_only_stop_market hatası ({symbol}): {e}")
+
+    # ─────────────────────────────────────────────────────────────────
     # 2.3.3  TRADE YÖNETİMİ (Fiziksel Binance Emirleriyle)
     # ─────────────────────────────────────────────────────────────────
 
     async def manage_open_trades(self, equity: float):
         """
-        The Shadow Tracker v4.0 — TICKER BAZLI Dinamik Stop-Loss Yönetimi.
+        The Shadow Tracker v5.0 — BINANCE NATIVE TRAILING STOP.
 
-        ÖNCEKİ SORUNLAR VE ÇÖZÜMLER:
-          • dict iteration crash      → list() kopyası üzerinden iterasyon
-          • Phantom Stop (fitil)     → OHLCV yerine TICKER (mark price) kullanımı
-          • -4130 orphan stop         → Kesin emir hiyerarşisi (önce temizle, sonra koy)
-          • Yanlış PnL (double-close) → Binance pozisyon kontrolü + gerçek çıkış fiyatı
+        DEĞİŞİKLİKLER (v5.0):
+          • Manuel dip takibi KALDIRILDI  → Binance'in TRAILING_STOP_MARKET emri kullanılıyor
+          • KURAL-3 cancel/replace döngüsü KALDIRILDI → bot artık 5sn'de bir stop silip koymuyor
+          • Breakeven aşamasında sadece STOP_MARKET güncelleniyor, TRAILING_STOP_MARKET'e dokunulmuyor
 
-        Stage 1 — Breakeven  : %{BREAKEVEN_DROP_PCT} düşüşte SL = entry
-        Stage 2 — TSL Aktif  : %{TSL_ACTIVATION_DROP_PCT} düşüşte Trailing Stop devreye girer
-        Stage 3 — SL Kontrol : current_price >= SL → fiziksel market close
+        Stage 1 — Breakeven  : %{BREAKEVEN_DROP_PCT} düşüşte sadece STOP_MARKET = entry'e çekilir
+        Stage 2 — TSL Log    : %{TSL_ACTIVATION_DROP_PCT}'e ulaşınca log — Binance kendi trailing'i yönetir
+        Stage 3 — SL Kontrol : RAM'deki SL >= current_price → acil kapatma (failsafe)
         Stage 4 — Yeşil Mum  : Zararda yeşil mum kapanışı → GREEN-10 / 2xGREEN-LOSS çıkışı
 
         Stage 1-3: TICKER (mark/last price) kullanır — OHLCV çekmez.
@@ -1318,9 +1380,8 @@ class PumpSnifferBot:
                     continue
                 current_price = float(current_price)
 
-                old_sl = trade.stop_loss  # SL değişimini takip etmek için
-
-                # ── Stage 1: Breakeven — düşüş >= %BREAKEVEN_DROP_PCT → SL = entry ─
+                # ── Stage 1: Breakeven — düşüş >= %BREAKEVEN_DROP_PCT ─────────
+                # Sadece STOP_MARKET entry'e çekilir. TRAILING_STOP_MARKET'e dokunulmaz.
                 if not trade.breakeven_triggered:
                     drop_pct = (trade.entry_price - current_price) / trade.entry_price * 100.0
                     if drop_pct >= Config.BREAKEVEN_DROP_PCT:
@@ -1333,37 +1394,52 @@ class PumpSnifferBot:
                             notifier.send(f"⚡ BREAKEVEN\n🪙 {sym}\n📉 Düşüş: {drop_pct:.1f}%\n🛡️ SL → Giriş fiyatı")
                         except Exception:
                             pass
-
-                # ── Stage 2: TSL — düşüş >= %TSL_ACTIVATION_DROP_PCT → trailing ───
-                drop_pct = (trade.entry_price - current_price) / trade.entry_price * 100.0
-                if not trade.tsl_active:
-                    if drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
-                        trade.tsl_active = True
-                        trade.lowest_low_reached = current_price
-                        new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
-                        trade.stop_loss = min(trade.stop_loss, new_sl)
-                        log.info(f"  🎯 TSL AKTİF: {sym}  Düşüş: %{drop_pct:.1f}  "
-                                 f"Low: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
+                        # STOP_MARKET'i entry'e çek — TSL'e dokunma
                         try:
-                            notifier.send(f"🎯 TSL AKTİF\n🪙 {sym}\n📉 Düşüş: {drop_pct:.1f}%\n🛡️ Trailing stop başlatıldı")
-                        except Exception:
-                            pass
-                else:
-                    # TSL zaten aktif — yeni dip takibi
-                    if current_price < trade.lowest_low_reached:
-                        trade.lowest_low_reached = current_price
-                        new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
-                        trade.stop_loss = min(trade.stop_loss, new_sl)
-                        log.info(f"  📉 TSL GÜNCELLE: {sym}  "
-                                 f"YeniLow: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
+                            mkt_info   = self.exchange.markets.get(sym, {})
+                            price_prec = get_digits(mkt_info.get("precision", {}).get("price"))
+                            sl_rounded = round(trade.entry_price, price_prec)
+                            hedge_be   = await self._detect_position_mode()
+                            await self._cancel_only_stop_market(sym)
+                            await asyncio.sleep(0.3)
+                            be_params = {"stopPrice": sl_rounded, "closePosition": True,
+                                         "workingType": "MARK_PRICE"}
+                            if hedge_be:
+                                be_params["positionSide"] = "SHORT"
+                            await self._safe_call(
+                                self.exchange.create_order,
+                                sym, "stop_market", "buy", None,
+                                params=be_params
+                            )
+                            log.info(f"  🟡 BE SL Binance'e gönderildi: {sl_rounded:.{price_prec}f}")
+                        except Exception as be_err:
+                            log.warning(f"  ⚠️ BE SL güncellenemedi ({sym}): {be_err}")
 
-                # ── KURAL 3: SL değiştiyse → ÖNCE temizle, SONRA güncelle ─────
-                if trade.stop_loss != old_sl:
-                    await self._cancel_algo_orders(sym, retry=True)
-                    await asyncio.sleep(0.2)
-                    await self._update_binance_sl(sym, trade.stop_loss)
+                # ── Stage 2: TSL Aktivasyon TakiBİ (BİLGİ) ──────────────────────
+                # Binance native TRAILING_STOP_MARKET çalışıyor — bot sadece loglama yapar.
+                drop_pct = (trade.entry_price - current_price) / trade.entry_price * 100.0
+                if not trade.tsl_active and drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
+                    trade.tsl_active = True
+                    trade.lowest_low_reached = current_price
+                    log.info(
+                        f"  🎯 TSL AKTİF (Binance native): {sym}  Düşüş: %{drop_pct:.1f}  "
+                        f"callbackRate=%{Config.TSL_TRAIL_PCT}"
+                    )
+                    try:
+                        notifier.send(
+                            f"🎯 TSL AKTİF\n🪙 {sym}\n📉 Düşüş: {drop_pct:.1f}%\n"
+                            f"🛡️ Binance trailing takipte (callback %{Config.TSL_TRAIL_PCT})"
+                        )
+                    except Exception:
+                        pass
+                elif trade.tsl_active and current_price < trade.lowest_low_reached:
+                    trade.lowest_low_reached = current_price
+                    log.debug(f"  📉 {sym} TSL yeni dip izleniyor: {current_price:.6f}")
 
-                # ── Stage 3: SL-Hit Kontrolü — current_price >= SL → kapat ────
+                # ── Stage 3: SL-Hit Kontrolü (RAM failsafe) ──────────────────────
+                # Binance native TSL/SL tetiklenince pozisyon kapanır.
+                # Buradaki kontrol: Binance'in SL'i tetiklemediği senaryolara karşı güvence.
+                # current_price >= trade.stop_loss → acil kapatma
                 if current_price >= trade.stop_loss:
                     # Binance'te gerçek pozisyon var mı kontrol et
                     real_exit_price = None
