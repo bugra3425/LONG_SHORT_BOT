@@ -1482,6 +1482,13 @@ class PumpSnifferBot:
                     continue
                 current_price = float(current_price)
 
+                # ── 🛡️ TSL DOKUNULMAZLIK KALKANI ─────────────────────────────
+                # Native TSL Binance'e emanet edildiyse bot müdahale ETMEZ.
+                # Breakeven, SL güncelleme, cancel_algo_orders — hiçbiri çalışmaz.
+                # Binance kendi trailing motoruyla pozisyonu yönetir.
+                if getattr(trade, "tsl_placed", False):
+                    continue
+
                 # ── Stage 1: Breakeven — düşüş >= %BREAKEVEN_DROP_PCT ─────────
                 # Sadece STOP_MARKET entry'e çekilir. TRAILING_STOP_MARKET'e dokunulmaz.
                 if not trade.breakeven_triggered:
