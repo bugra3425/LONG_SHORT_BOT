@@ -1115,15 +1115,16 @@ class PumpSnifferBot:
             tsl_params = {
                 "activationPrice": activation_price,
                 "callbackRate"   : Config.TSL_TRAIL_PCT,
-                "closePosition"  : True,
+                "reduceOnly"     : True,   # closePosition yerine reduceOnly kullan (-4136 fix)
                 "workingType"    : "MARK_PRICE",
             }
             if hedge:
                 tsl_params["positionSide"] = "SHORT"
+                del tsl_params["reduceOnly"]  # Hedge Mode'da reduceOnly gönderilemez
             try:
                 await self._safe_call(
                     self.exchange.create_order,
-                    symbol, "trailing_stop_market", "buy", None,
+                    symbol, "trailing_stop_market", "buy", qty,
                     params=tsl_params
                 )
                 log.info(
