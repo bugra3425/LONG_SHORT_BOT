@@ -1022,6 +1022,33 @@ class PumpSnifferBot:
             price_prec = get_digits(market.get("precision", {}).get("price"))
             sl_rounded = round(new_sl_price, price_prec)
 
+            # 0) Pozisyon gerçekten açık mı? (-4509 koruması)
+            try:
+                positions = await self._safe_call(self.exchange.fetch_positions, [symbol])
+                has_position = any(
+                    abs(float(p.get("contracts", 0))) > 0
+                    for p in (positions or [])
+                    if p.get("symbol") == symbol
+                )
+            except Exception:
+                has_position = True  # Kontrol başarısız → devam et, borsa reddederse yakalar
+
+            if not has_position:
+                log.warning(f"  ⚠️ {symbol}: Binance'te açık pozisyon yok — SL güncelleme atlandı, trade kapatılıyor.")
+                await self._cancel_algo_orders(symbol, retry=False)
+                trade = self.active_trades.pop(symbol, None)
+                if trade:
+                    trade.exit_time   = datetime.now(timezone.utc).isoformat()
+                    trade.exit_price  = new_sl_price
+                    trade.exit_reason = "POZISYON-YOK"
+                    self.trade_history.append(trade)
+                    self._save_state()
+                    try:
+                        notifier.send(f"ℹ️ {symbol} pozisyonu dışarıdan kapanmış — bot kaydı temizlendi.")
+                    except Exception:
+                        pass
+                return
+
             # 1) Eski stop emrini sil
             await self._cancel_algo_orders(symbol, retry=True)
             await asyncio.sleep(0.2)  # Binance senkronizasyon bekleme
@@ -1054,6 +1081,17 @@ class PumpSnifferBot:
                         }
                     )
                     log.info(f"  🔄 SL GÜNCELLENDI (retry sonrası): {symbol}  → {sl_rounded:.{price_prec}f}")
+                elif "-4509" in str(e):
+                    # -4509: Pozisyon yok — trade kaydını temizle
+                    log.warning(f"  ⚠️ -4509: {symbol} pozisyonu yok, trade kaydı temizleniyor.")
+                    await self._cancel_algo_orders(symbol, retry=False)
+                    trade = self.active_trades.pop(symbol, None)
+                    if trade:
+                        trade.exit_time   = datetime.now(timezone.utc).isoformat()
+                        trade.exit_price  = new_sl_price
+                        trade.exit_reason = "POZISYON-YOK"
+                        self.trade_history.append(trade)
+                        self._save_state()
                 else:
                     raise
         except Exception as e:
