@@ -1676,7 +1676,8 @@ class PumpSnifferBot:
     def _prep_offset_sec() -> int:
         """Timeframe'e göre dinamik PREP offset (kapanıştan kaç saniye önce tara)."""
         tf_min = PumpSnifferBot._tf_to_minutes()
-        if tf_min <= 15:  return 2 * 60
+        if tf_min <= 5:   return 3 * 60   # 5m  → 3dk önce
+        if tf_min <= 15:  return 3 * 60   # 15m → 3dk önce
         if tf_min <= 30:  return 3 * 60
         if tf_min <= 60:  return 5 * 60
         if tf_min <= 120: return 8 * 60
