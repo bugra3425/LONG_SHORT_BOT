@@ -1041,18 +1041,40 @@ class PumpSnifferBot:
                 self._close_trade_locally(symbol, new_sl_price, "POZISYON-YOK")
                 return
 
-            # 1) Cancel + Place loop (max 3 deneme, -4130 için)
-            last_err = None
-            for attempt in range(1, 4):
-                # Agresif temizlik: önce tekil, sonra cancel_all
-                await self._cancel_algo_orders(symbol, retry=True)
+            # 1) Agresif temizlik + doğrulama döngüsü (max 4 deneme)
+            for attempt in range(1, 5):
+                # a) cancel_all_orders (en kapsamlı)
                 try:
                     await self._safe_call(self.exchange.cancel_all_orders, symbol)
                 except Exception:
                     pass
-                wait = 0.5 * attempt  # 0.5s → 1.0s → 1.5s
-                await asyncio.sleep(wait)
+                # b) Algo emirleri de temizle
+                await self._cancel_algo_orders(symbol, retry=False)
+                # c) Binance'e işlem süre tanı
+                await asyncio.sleep(0.8 + 0.4 * attempt)  # 1.2s → 1.6s → 2.0s → 2.4s
 
+                # d) DOĞRULAMA: Hâlâ stop emri var mı?
+                still_open = []
+                try:
+                    open_orders = await self._safe_call(self.exchange.fetch_open_orders, symbol)
+                    still_open = [
+                        o for o in (open_orders or [])
+                        if (o.get("type") or "").upper() in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT")
+                    ]
+                    # Kalan emirleri tek tek iptal et
+                    for o in still_open:
+                        try:
+                            await self._safe_call(self.exchange.cancel_order, o["id"], symbol)
+                        except Exception:
+                            pass
+                    if still_open:
+                        log.warning(f"  ⚠️ {symbol}: {len(still_open)} stop emri hâlâ duruyor, deneme {attempt}/4…")
+                        await asyncio.sleep(0.5)
+                        continue  # Tekrar temizlemeye çalış
+                except Exception:
+                    pass  # Kontrol başarısız → yine de denemeye geç
+
+                # e) Temizlik onaylandı → yeni SL koy
                 try:
                     await self._safe_call(
                         self.exchange.create_order,
@@ -1064,13 +1086,12 @@ class PumpSnifferBot:
                         }
                     )
                     log.info(f"  🔄 SL GÜNCELLENDI (Binance, deneme {attempt}): {symbol}  → {sl_rounded:.{price_prec}f}")
-                    return  # Başarılı — çık
+                    return  # Başarılı
                 except ccxt.ExchangeError as e:
                     err_str = str(e)
                     if "-4130" in err_str:
-                        log.warning(f"  ⚠️ -4130 deneme {attempt}/3 ({symbol}) — tekrar temizleyip bekleniyor…")
-                        last_err = e
-                        continue  # Tekrar dene
+                        log.warning(f"  ⚠️ -4130 deneme {attempt}/4 ({symbol}) — orphan hâlâ var, tekrar temizleniyor…")
+                        continue
                     elif "-4509" in err_str:
                         log.warning(f"  ⚠️ -4509: {symbol} pozisyonu yok, trade kaydı temizleniyor.")
                         self._close_trade_locally(symbol, new_sl_price, "POZISYON-YOK")
@@ -1078,8 +1099,7 @@ class PumpSnifferBot:
                     else:
                         raise
 
-            # 3 deneme de başarısız
-            log.error(f"  ❌ SL güncellenemedi 3 denemede ({symbol}): {last_err}")
+            log.error(f"  ❌ SL güncellenemedi 4 denemede ({symbol}) — orphan stop temizlenemiyor.")
 
         except Exception as e:
             log.error(f"  ❌ Binance SL güncelleme hatası ({symbol}): {e}")
