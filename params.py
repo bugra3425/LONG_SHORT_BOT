@@ -19,7 +19,7 @@ PUMP_WINDOW_CANDLES = 6
 PUMP_MIN_GREEN_COUNT = 3
 PUMP_CANDLE_BODY_MIN_PCT = 0.1
 TOP_N_GAINERS = 15
-MIN_VOLUME_USDT = 500_000.0
+MIN_VOLUME_USDT = 5_000_000.0
 
 # ──────────────────────────────────────────────────────────────────────
 #  BÖLÜM 3 — GİRİŞ TETİKLEYİCİ KOŞULLARI (Anında Giriş)
