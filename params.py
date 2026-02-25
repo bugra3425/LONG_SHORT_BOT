@@ -14,7 +14,7 @@ TIMEFRAME = "5m"
 #  BÖLÜM 2 — PUMP TESPİT KOŞULLARI (Mikro Pump)
 # ──────────────────────────────────────────────────────────────────────
 
-PUMP_MIN_PCT = 10
+PUMP_MIN_PCT = 3
 PUMP_WINDOW_CANDLES = 6
 PUMP_MIN_GREEN_COUNT = 3
 PUMP_CANDLE_BODY_MIN_PCT = 0.1
