@@ -1119,10 +1119,10 @@ class PumpSnifferBot:
             if hedge:
                 open_params = {"positionSide": "SHORT"}
                 sl_params   = {"stopPrice": None, "positionSide": "SHORT",
-                               "closePosition": True, "workingType": "MARK_PRICE"}
+                               "workingType": "MARK_PRICE"}
             else:
                 open_params = {"reduceOnly": False}
-                sl_params   = {"stopPrice": None, "closePosition": True,
+                sl_params   = {"stopPrice": None, "reduceOnly": True,
                                "workingType": "MARK_PRICE"}
 
             # ── Market emri — 3'lü Geniş Ağ Retry (Catch-All) ─────────────────
@@ -1169,7 +1169,7 @@ class PumpSnifferBot:
             try:
                 await self._safe_call(
                     self.exchange.create_order,
-                    symbol, "stop_market", "buy", None,
+                    symbol, "stop_market", "buy", qty,
                     params=sl_params
                 )
                 log.info(f"  🟥 SL koyuldu: {sl_price:.{price_prec}f}")
@@ -1178,7 +1178,7 @@ class PumpSnifferBot:
                     await self._cancel_algo_orders(symbol)
                     await self._safe_call(
                         self.exchange.create_order,
-                        symbol, "stop_market", "buy", None,
+                        symbol, "stop_market", "buy", qty,
                         params=sl_params
                     )
                 else:
@@ -1317,14 +1317,25 @@ class PumpSnifferBot:
                     hedge = await self._detect_position_mode()
                     sl_order_params = {
                         "stopPrice"    : sl_rounded,
-                        "closePosition": True,
                         "workingType"  : "MARK_PRICE",
                     }
                     if hedge:
                         sl_order_params["positionSide"] = "SHORT"
+                    else:
+                        sl_order_params["reduceOnly"] = True
+                    # qty al
+                    _plist = await self._safe_call(self.exchange.fetch_positions, [symbol])
+                    _sl_qty = 0.0
+                    for _pp in (_plist or []):
+                        if _pp.get("symbol") == symbol:
+                            _sl_qty = abs(float(_pp.get("contracts", 0)))
+                            break
+                    _mkt2 = self.exchange.markets.get(symbol, {})
+                    _ap2  = get_digits(_mkt2.get("precision", {}).get("amount"))
+                    _sl_qty = round(_sl_qty, _ap2) if _sl_qty > 0 else None
                     await self._safe_call(
                         self.exchange.create_order,
-                        symbol, "stop_market", "buy", None,
+                        symbol, "stop_market", "buy", _sl_qty,
                         params=sl_order_params
                     )
                     log.info(f"  🔄 SL GÜNCELLENDI (Binance, deneme {attempt}): {symbol}  → {sl_rounded:.{price_prec}f}")
@@ -1489,17 +1500,31 @@ class PumpSnifferBot:
                         try:
                             mkt_info   = self.exchange.markets.get(sym, {})
                             price_prec = get_digits(mkt_info.get("precision", {}).get("price"))
+                            amt_prec   = get_digits(mkt_info.get("precision", {}).get("amount"))
                             sl_rounded = round(trade.entry_price, price_prec)
                             hedge_be   = await self._detect_position_mode()
+                            # Pozisyon miktarını Binance'ten al
+                            _pos_list = await self._safe_call(self.exchange.fetch_positions, [sym])
+                            _be_qty = 0.0
+                            for _pp in (_pos_list or []):
+                                if _pp.get("symbol") == sym:
+                                    _be_qty = abs(float(_pp.get("contracts", 0)))
+                                    break
+                            if _be_qty <= 0:
+                                log.warning(f"  ⚠️ BE: {sym} pozisyon miktarı alınamadı")
+                                return
+                            _be_qty = round(_be_qty, amt_prec)
                             await self._cancel_only_stop_market(sym)
                             await asyncio.sleep(0.3)
-                            be_params = {"stopPrice": sl_rounded, "closePosition": True,
-                                         "workingType": "MARK_PRICE"}
+                            # closePosition:True yerine reduceOnly+qty — TSL ile çakışmaz
+                            be_params = {"stopPrice": sl_rounded, "workingType": "MARK_PRICE"}
                             if hedge_be:
                                 be_params["positionSide"] = "SHORT"
+                            else:
+                                be_params["reduceOnly"] = True
                             await self._safe_call(
                                 self.exchange.create_order,
-                                sym, "stop_market", "buy", None,
+                                sym, "stop_market", "buy", _be_qty,
                                 params=be_params
                             )
                             log.info(f"  🟡 BE SL Binance'e gönderildi: {sl_rounded:.{price_prec}f}")
