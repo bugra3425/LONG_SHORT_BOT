@@ -498,6 +498,8 @@ class PumpSnifferBot:
                 if has_tsl:
                     trade.tsl_placed = True
                     log.info(f"  ✅ {sym}: Binance'te TSL mevcut")
+                    # TSL varken STOP_MARKET varsa temizle (artık gereksiz)
+                    await self._cancel_only_stop_market(sym)
                     continue
                 # TSL yok → pozisyon miktarını al
                 positions = await self._safe_call(self.exchange.fetch_positions, [sym])
@@ -539,6 +541,9 @@ class PumpSnifferBot:
                     f"  🔧 {sym}: TSL EKLENdİ — "
                     f"aktivasyon={act:.{pp}f} | callback=%{Config.TSL_TRAIL_PCT}"
                 )
+                # TSL koyuldu — eski STOP_MARKET gereksiz, temizle
+                await self._cancel_only_stop_market(sym)
+                log.info(f"  🧹 {sym} başlatış TSL sonrası STOP_MARKET iptal edildi")
                 try:
                     notifier.send(
                         f"🔧 Başlatışta TSL Eklendi\n🪙 {sym}\n"
@@ -1254,6 +1259,9 @@ class PumpSnifferBot:
                             f"Düşüş Hedefi: {activation_price:.{price_prec}f} | "
                             f"Takip: %{Config.TSL_TRAIL_PCT}"
                         )
+                        # TSL koyuldu — artık STOP_MARKET gereksiz, temizle
+                        await self._cancel_only_stop_market(symbol)
+                        log.info(f"  🧹 {symbol} STOP_MARKET iptal edildi (TSL aktif)")
                     except Exception as e:
                         log.error(f"  ❌ {symbol} TSL Emri Gönderilemedi: {e}")
 
