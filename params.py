@@ -28,7 +28,7 @@ TIMEFRAME = "4h"
 #  BÖLÜM 2 — PUMP TESPİT KOŞULLARİ (Module 1 — Radar)
 # ──────────────────────────────────────────────────────────────────────
 
-PUMP_MIN_PCT = 20.0
+PUMP_MIN_PCT = 30.0
 # Pump penceresi boyunca minimum kazanç yüzdesi (window[0].low → son kapanış)
 # Örnek: 30 → son 6 mumda dip'ten kapanışa %30+ çıkış olmalı
 # Daha az sinyal istiyorsan artır (35, 40), fazla sinyal istiyorsan düşür (20, 25)
