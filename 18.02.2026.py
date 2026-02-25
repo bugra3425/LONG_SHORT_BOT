@@ -550,6 +550,57 @@ class PumpSnifferBot:
                 log.warning(f"  ⚠️ {sym} startup TSL hatası: {e}")
         self._save_state()
 
+    async def _cleanup_orphan_orders(self):
+        """
+        Pozisyonu kapanmış ama açık emri kalan coinleri temizler.
+        Örnek: TSL ve SL aynı anda açıkken TSL tetiklenince SL orfan kalır.
+        Her çağrıda Binance'teki open orders ile aktif pozisyon listesini karşılaştırır,
+        pozisyon olmayan sembollerin tüm emirlerini iptal eder.
+        """
+        try:
+            # Binance'teki tüm açık pozisyonları al
+            positions = await self._safe_call(self.exchange.fetch_positions)
+            live_symbols = set()
+            for p in (positions or []):
+                if abs(float(p.get("contracts") or 0)) > 0:
+                    live_symbols.add(p.get("symbol"))
+
+            # Tüm açık emirleri al (standard + conditional)
+            open_orders = []
+            try:
+                open_orders = await self._safe_call(self.exchange.fetch_open_orders)
+            except Exception:
+                pass
+            try:
+                cond = await self._safe_call(
+                    self.exchange.fetch_open_orders,
+                    params={"stop": True}
+                )
+                open_orders = (open_orders or []) + (cond or [])
+            except Exception:
+                pass
+
+            # Hangi semboller orfan?
+            orphan_symbols = set()
+            for o in (open_orders or []):
+                sym = o.get("symbol")
+                if sym and sym not in live_symbols:
+                    orphan_symbols.add(sym)
+
+            if not orphan_symbols:
+                return
+
+            log.info(f"🧹 Orfan emir temizliği: {orphan_symbols}")
+            for sym in orphan_symbols:
+                await self._cancel_algo_orders(sym, retry=True)
+                # active_trades'den de sil (hayalet kayıt)
+                if sym in self.active_trades:
+                    del self.active_trades[sym]
+                    log.info(f"  🗑️  {sym} active_trades'den silindi (pozisyon yok)")
+            self._save_state()
+        except Exception as e:
+            log.warning(f"⚠️ Orfan emir temizlik hatası: {e}")
+
     # ─────────────────────────────────────────────────────────────────
     # 2.0.1  API ANAHTAR YÜKLEME
     # ─────────────────────────────────────────────────────────────────
@@ -1484,9 +1535,30 @@ class PumpSnifferBot:
 
                 # ── 🛡️ TSL DOKUNULMAZLIK KALKANI ─────────────────────────────
                 # Native TSL Binance'e emanet edildiyse bot müdahale ETMEZ.
-                # Breakeven, SL güncelleme, cancel_algo_orders — hiçbiri çalışmaz.
-                # Binance kendi trailing motoruyla pozisyonu yönetir.
+                # Ama pozisyon kapandıysa (TSL tetiklendiyse) active_trades'den sil.
                 if getattr(trade, "tsl_placed", False):
+                    try:
+                        pos_list = await self._safe_call(
+                            self.exchange.fetch_positions, [sym]
+                        )
+                        still_open = any(
+                            abs(float(p.get("contracts") or 0)) > 0
+                            for p in (pos_list or [])
+                            if p.get("symbol") == sym
+                        )
+                    except Exception:
+                        still_open = True  # Hata varsa dokunma
+                    if not still_open:
+                        log.info(
+                            f"  ✅ {sym}: TSL tetiklendi → pozisyon kapandı, kayıt silindi"
+                        )
+                        try:
+                            notifier.notify_trade_close(
+                                sym, "NATIVE-TSL", trade.pnl_pct, trade.pnl_usdt
+                            )
+                        except Exception:
+                            pass
+                        closed.append(sym)
                     continue
 
                 # ── Stage 1: Breakeven — düşüş >= %BREAKEVEN_DROP_PCT ─────────
@@ -1963,6 +2035,7 @@ class PumpSnifferBot:
         Her 5 saniyede bir çalışır. Rate limit safe — sadece açık pozisyonlar kontrol edilir.
         Geçmiş fitillere bakmama ve anlık fiyatla TSL/BE hesaplama kuralları korunur.
         """
+        _last_orphan_cleanup = 0.0  # Son orfan temizlik zamanı
         while self.running:
             try:
                 if not self.active_trades:
@@ -1976,6 +2049,12 @@ class PumpSnifferBot:
                     equity = 10_000
 
                 await self.manage_open_trades(equity)
+
+                # Her 60 saniyede bir orfan emir temizliği
+                now = time.monotonic()
+                if now - _last_orphan_cleanup >= 60:
+                    await self._cleanup_orphan_orders()
+                    _last_orphan_cleanup = now
 
             except Exception as e:
                 log.error(f"🔴 Trade Manager hatası: {e}")
@@ -1999,6 +2078,7 @@ class PumpSnifferBot:
         self._load_state()
         await self._recover_from_binance()
         await self._startup_tsl_check()
+        await self._cleanup_orphan_orders()
         tf           = Config.TIMEFRAME.upper()
         next_close   = self._next_close_utc()
         prep_offset  = self._prep_offset_sec()
