@@ -50,7 +50,7 @@ TSL_TRAIL_PCT = 2.0
 #  BÖLÜM 5 — RİSK YÖNETİMİ
 # ──────────────────────────────────────────────────────────────────────
 
-LEVERAGE = 1
+LEVERAGE = 3
 MAX_ACTIVE_TRADES = 5
 RISK_PER_TRADE_PCT = 0.5
 
