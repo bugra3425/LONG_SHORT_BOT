@@ -981,7 +981,8 @@ class PumpSnifferBot:
                             await asyncio.sleep(1.5 * (attempt + 1))  # 1.5s, 3s
 
             if not order_placed:
-                raise RuntimeError(f"Market emri {max_retries} denemede başarısız")
+                log.warning(f"  ⛔ {symbol}: Market emri {max_retries} denemede başarısız — trade kaydı oluşturulmadı.")
+                return None
 
             await self._cancel_algo_orders(symbol)
 
