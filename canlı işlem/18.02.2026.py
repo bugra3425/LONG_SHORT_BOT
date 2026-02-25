@@ -350,6 +350,7 @@ class PumpSnifferBot:
         self._new_push: Dict[str, bool] = {}            # sym → çıkış sonrası yeni push görüldü mü?
         self._processed_signals: Dict[str, str] = {}    # sym → son sinyal timestamp (Tekilleştirme)
         self._prep_done: Optional[asyncio.Event] = None  # PREP→TRIGGER senkronizasyonu
+        self._hedge_mode: Optional[bool] = None          # Hedge/One-way mode cache
         self.running = False
 
     # ─────────────────────────────────────────────────────────────────
@@ -727,66 +728,108 @@ class PumpSnifferBot:
 
     async def _cancel_algo_orders(self, symbol: str, retry: bool = True) -> bool:
         """
-        Doküman Madde 2: Algo emirleri (STOP_MARKET/TAKE_PROFIT_MARKET) standart
-        fetch_open_orders / cancel_all_orders ile görünmez. Ayrı API gerektirir.
-        Bu metod HEM standart HEM algo stop emirlerini temizler.
-        
-        v3.9.5: Standart open orders + algo orders birlikte temizlenir.
-                 -4130 hatasının kök nedeni (orphan standart stop) çözüldü.
+        SNIPER CANCEL v5.0 — 3 turda doğrulamalı temizlik.
+        Her tur: toplu iptal → raw endpoint → ID bazlı tek tek → algo → doğrulama.
+        Doğrulama geçerse erken çıkar; geçmezse tekrar dener.
+        closePosition=True / GTE_GTC emirleri de kapsanır.
         """
         raw_sym = symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT")
-        max_attempts = 2 if retry else 1
-        cleaned = 0
-        
-        for attempt in range(max_attempts):
+        max_rounds = 3 if retry else 1
+
+        for round_num in range(1, max_rounds + 1):
+            cleaned = 0
+
+            # ── ADIM 1: Standart toplu iptal ──────────────────────────────────
             try:
-                # 1) Standart açık emirleri temizle (STOP_MARKET dahil)
-                try:
-                    open_orders = await self._safe_call(
-                        self.exchange.fetch_open_orders, symbol
-                    )
-                    for order in open_orders:
-                        otype = (order.get("type") or "").upper()
-                        if otype in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"):
-                            try:
-                                await self._safe_call(
-                                    self.exchange.cancel_order, order["id"], symbol
-                                )
-                                cleaned += 1
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+                await self.exchange.cancel_all_orders(symbol)
+            except Exception:
+                pass
 
-                # 2) Algo emirleri temizle
-                try:
-                    open_algo = await self._safe_call(
-                        self.exchange.fapiPrivateGetOpenAlgoOrders,
-                        {"symbol": raw_sym}
-                    )
-                    orders = open_algo.get("orders", []) if isinstance(open_algo, dict) else []
-                    if orders:
-                        await self._safe_call(
-                            self.exchange.fapiPrivateDeleteAlgoOpenOrders,
-                            {"symbol": raw_sym}
-                        )
-                        cleaned += len(orders)
-                except Exception:
-                    pass
+            # ── ADIM 2: Raw Binance endpoint (GTE / closePosition emirler) ────
+            try:
+                await self.exchange.fapiPrivateDeleteAllOpenOrders({"symbol": raw_sym})
+            except Exception:
+                pass
 
-                if cleaned > 0:
-                    log.info(f"  🗑️ Emirler temizlendi: {symbol} ({cleaned} emir)")
-                    await asyncio.sleep(0.2)  # Binance senkronizasyonu için
-                return True
+            # Binance matching engine'in işlemi kaydetmesi için bekle
+            await asyncio.sleep(0.6)
+
+            # ── ADIM 3: ID bazlı sniper — kalan emirleri tek tek vur ──────────
+            try:
+                open_orders = await self.exchange.fetch_open_orders(symbol)
+                for order in open_orders:
+                    oid = order.get("id")
+                    if not oid:
+                        continue
+                    for _attempt in range(2):  # Her emir için 2 deneme
+                        try:
+                            await self.exchange.cancel_order(oid, symbol)
+                            cleaned += 1
+                            log.debug(f"  🎯 Sniper cancel: {symbol} ID:{oid} iptal edildi")
+                            break
+                        except Exception as e:
+                            if "-2011" in str(e):  # Zaten iptal edilmiş
+                                break
+                            await asyncio.sleep(0.3)
             except Exception as e:
-                if attempt < max_attempts - 1:
-                    log.debug(f"  Algo temizlik deneme {attempt+1} başarısız ({symbol}), tekrar deneniyor...")
-                    await asyncio.sleep(0.3)
-                    continue
+                log.debug(f"  ⚠️ fetch_open_orders ({symbol}): {e}")
+
+            # ── ADIM 4: Algo emirler (TWAP / VP) ─────────────────────────────
+            try:
+                open_algo = await self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": raw_sym})
+                algo_list = open_algo.get("orders", []) if isinstance(open_algo, dict) else []
+                if algo_list:
+                    await self.exchange.fapiPrivateDeleteAlgoOpenOrders({"symbol": raw_sym})
+                    cleaned += len(algo_list)
+            except Exception:
+                pass
+
+            await asyncio.sleep(0.4)
+
+            # ── ADIM 5: Doğrulama — hala emir var mı? ────────────────────────
+            try:
+                remaining = await self.exchange.fetch_open_orders(symbol)
+                if not remaining:
+                    if cleaned > 0:
+                        log.info(f"  🗑️ Sniper v5 OK: {symbol} ({cleaned} emir temizlendi)")
+                    return True
+                # Hala emir var — sonraki tura geç
+                if round_num < max_rounds:
+                    log.warning(
+                        f"  ⚠️ {symbol}: {len(remaining)} emir hala açık — "
+                        f"tur {round_num}/{max_rounds}, tekrar deneniyor..."
+                    )
+                    await asyncio.sleep(1.0)
                 else:
-                    log.warning(f"  ⚠️ Algo temizlik hatası ({symbol}): {e}")
-                    return False
+                    log.warning(
+                        f"  ❌ {symbol}: {len(remaining)} emir {max_rounds} turda silinemedi — "
+                        f"RAM SL devreye girecek."
+                    )
+            except Exception:
+                # Doğrulama yapılamadı, iyimser devam et
+                return True
+
         return False
+
+    async def _detect_position_mode(self) -> bool:
+        """
+        Binance hesabının Hedge Mode'da olup olmadığını tespit eder.
+        Sonucu cache'ler — sadece ilk çağrıda Binance'e gider.
+        Returns: True = Hedge Mode, False = One-Way Mode
+        """
+        if self._hedge_mode is not None:
+            return self._hedge_mode
+        try:
+            resp = await self._safe_call(
+                self.exchange.fapiPrivateGetPositionSideDual
+            )
+            self._hedge_mode = bool(resp.get("dualSidePosition", False))
+        except Exception as e:
+            log.warning(f"⚠️ Position mode tespit edilemedi: {e} — One-Way varsayılıyor.")
+            self._hedge_mode = False
+        mode_str = "HEDGE MODE 🔀" if self._hedge_mode else "ONE-WAY MODE ↔️"
+        log.info(f"📍 Binance Position Mode: {mode_str}")
+        return self._hedge_mode
 
     async def open_short(self, symbol: str, entry_price: float,
                          pump_item: WatchlistItem, equity: float,
@@ -827,6 +870,7 @@ class PumpSnifferBot:
         )
 
         # ── Exchange emir gönderimi ───────────────────────────────────
+        order_placed = False  # Market emri gerçekten açıldı mı?
         try:
             await self._safe_call(self.exchange.load_markets)
             market      = self.exchange.markets.get(symbol, {})
@@ -834,6 +878,13 @@ class PumpSnifferBot:
             amount_prec = get_digits(market.get("precision", {}).get("amount"))
 
             qty = round(pos["qty"], amount_prec)
+
+            # ── maxQty kontrolü (-4005 fix) ───────────────────────────
+            limits  = market.get("limits", {})
+            max_qty = (limits.get("amount") or {}).get("max")
+            if max_qty and qty > float(max_qty):
+                log.warning(f"  ⚠️ {symbol}: qty={qty} > maxQty={max_qty} — kırpılıyor.")
+                qty = round(float(max_qty), amount_prec)
 
             if qty * entry_price < Config.MIN_NOTIONAL_USDT:
                 log.warning(f"  ⚠️ {symbol}: Notional < {Config.MIN_NOTIONAL_USDT} USDT — atlanıyor.")
@@ -843,34 +894,43 @@ class PumpSnifferBot:
             try:
                 await self._safe_call(self.exchange.set_margin_mode, "isolated", symbol)
             except ccxt.ExchangeError as e:
-                # "No need to change margin type" hatası zaten isolated ise gelir — yoksay
                 if "-4046" not in str(e):
                     log.warning(f"  ⚠️ Margin mode ayarlanamadı ({symbol}): {e}")
 
             await self._safe_call(self.exchange.set_leverage, pos["leverage"], symbol)
 
+            # Position mode (hedge vs one-way) belirle — emri doğru params ile gönder
+            hedge = await self._detect_position_mode()
+
             # İşlem açılmadan HEMEN ÖNCE eski algo emirleri temizle (-4130 fix)
             await self._cancel_algo_orders(symbol)
+
+            if hedge:
+                open_params = {"positionSide": "SHORT"}
+                sl_params   = {"stopPrice": None, "positionSide": "SHORT",
+                               "closePosition": True, "workingType": "MARK_PRICE"}
+            else:
+                open_params = {"reduceOnly": False}
+                sl_params   = {"stopPrice": None, "closePosition": True,
+                               "workingType": "MARK_PRICE"}
 
             order = await self._safe_call(
                 self.exchange.create_order,
                 symbol, "market", "sell", qty,
-                params={"reduceOnly": False}
+                params=open_params
             )
+            order_placed = True  # Market emri başarıyla gönderildi
             log.info(f"  📤 Market SHORT emir: {order.get('id', 'N/A')}")
 
             await self._cancel_algo_orders(symbol)
 
             sl_price = round(pos["sl"], price_prec)
+            sl_params["stopPrice"] = sl_price
             try:
                 await self._safe_call(
                     self.exchange.create_order,
                     symbol, "stop_market", "buy", None,
-                    params={
-                        "stopPrice"    : sl_price,
-                        "closePosition": True,
-                        "workingType"  : "MARK_PRICE",
-                    }
+                    params=sl_params
                 )
                 log.info(f"  🟥 SL koyuldu: {sl_price:.{price_prec}f}")
             except ccxt.ExchangeError as e:
@@ -879,11 +939,7 @@ class PumpSnifferBot:
                     await self._safe_call(
                         self.exchange.create_order,
                         symbol, "stop_market", "buy", None,
-                        params={
-                            "stopPrice"    : sl_price,
-                            "closePosition": True,
-                            "workingType"  : "MARK_PRICE",
-                        }
+                        params=sl_params
                     )
                 else:
                     raise
@@ -891,8 +947,10 @@ class PumpSnifferBot:
         except Exception as e:
             log.error(f"  ❌ Emir gönderilemedi ({symbol}): {e}")
 
-        # Market emri ID'si varsa, SL hata verse bile bu işlemi takip etmeliyiz
-        # Aksi halde bot sonsuz döngüde sürekli yeni market emri açar
+        # Market emri gönderilmediyse active_trades'e ekleme — hayalet trade önlemi
+        if not order_placed:
+            log.warning(f"  ⛔ {symbol}: Market emri başarısız — trade kaydı oluşturulmadı.")
+            return None
         self.active_trades[symbol] = trade
         log.info(
             f"  ✅ SHORT AÇILDI [{('DEMO 🧪' if Config.DEMO_MODE else 'CANLI ⚠️')}]: {symbol}\n"

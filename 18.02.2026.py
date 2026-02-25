@@ -348,6 +348,31 @@ class PumpSnifferBot:
         self._processed_signals: Dict[str, str] = {}    # sym → son sinyal timestamp (Tekilleştirme)
         self._prep_done: Optional[asyncio.Event] = None  # PREP→TRIGGER senkronizasyonu
         self.running = False
+        self._hedge_mode: Optional[bool] = None  # Binance position mode cache
+
+    # ─────────────────────────────────────────────────────────────────
+    # 1.1.0  POSITION MODE DETECTION
+    # ─────────────────────────────────────────────────────────────────
+    async def _detect_position_mode(self) -> bool:
+        """
+        Binance hesabının Hedge Mode'da olup olmadığını tespit eder.
+        Sonucu cache'ler — sadece ilk çağrıda Binance'e gider.
+        Returns: True = Hedge Mode, False = One-Way Mode
+        """
+        if self._hedge_mode is not None:
+            return self._hedge_mode
+        try:
+            resp = await self._safe_call(
+                self.exchange.fapiPrivateGetPositionSideDual
+            )
+            # dualSidePosition: true → Hedge Mode
+            self._hedge_mode = bool(resp.get("dualSidePosition", False))
+        except Exception as e:
+            log.warning(f"⚠️ Position mode tespit edilemedi: {e} — One-Way varsayılıyor.")
+            self._hedge_mode = False
+        mode_str = "HEDGE MODE 🔀" if self._hedge_mode else "ONE-WAY MODE ↔️"
+        log.info(f"📍 Binance Position Mode: {mode_str}")
+        return self._hedge_mode
 
     # ─────────────────────────────────────────────────────────────────
     # 2.0.0  KALICI DURUM YÖNETİMİ  (restart koruması)
@@ -815,69 +840,88 @@ class PumpSnifferBot:
 
     async def _cancel_algo_orders(self, symbol: str, retry: bool = True) -> bool:
         """
-        Doküman Madde 2: Algo emirleri (STOP_MARKET/TAKE_PROFIT_MARKET) standart
-        fetch_open_orders / cancel_all_orders ile görünmez. Ayrı API gerektirir.
-        Bu metod HEM standart HEM algo stop emirlerini temizler.
-
-        v4.0 — SNIPER CANCEL: Her emir ID'ye göre tek tek zorla iptal edilir.
-               cancel_all toplu silip geçemediği GTE/closePosition emirlerini çözer.
+        SNIPER CANCEL v5.0 — 3 turda doğrulamalı temizlik.
+        Her tur: toplu iptal → raw endpoint → ID bazlı tek tek → algo → doğrulama.
+        Doğrulama geçerse erken çıkar; geçmezse tekrar dener.
+        closePosition=True / GTE_GTC emirleri de kapsanır.
         """
         raw_sym = symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT")
-        cleaned = 0
+        max_rounds = 3 if retry else 1
 
-        # ── ADIM 1: Toplu cancel (limit emirleri ve normal stop'lar için) ──────
-        try:
-            await self.exchange.cancel_all_orders(symbol)
-        except Exception:
-            pass
+        for round_num in range(1, max_rounds + 1):
+            cleaned = 0
 
-        # ── ADIM 2: Raw Binance endpoint — tüm açık emirleri sil ──────────────
-        try:
-            await self._safe_call(
-                self.exchange.fapiPrivateDeleteAllOpenOrders,
-                {"symbol": raw_sym}
-            )
-        except Exception:
-            pass
+            # ── ADIM 1: Standart toplu iptal ──────────────────────────────────
+            try:
+                await self.exchange.cancel_all_orders(symbol)
+            except Exception:
+                pass
 
-        # ── ADIM 3: SNIPER — açık kalan emirleri çek, ID bazlı tek tek iptal ──
-        try:
-            open_orders = await self.exchange.fetch_open_orders(symbol)
-            for order in open_orders:
-                order_id = order.get("id")
-                if not order_id:
-                    continue
-                try:
-                    await self.exchange.cancel_order(order_id, symbol)
-                    cleaned += 1
-                    log.debug(f"  🎯 Sniper cancel: {symbol} emir {order_id} iptal edildi")
-                except Exception as e:
-                    log.debug(f"  ⚠️ Sniper cancel başarısız ({order_id}): {e}")
-        except Exception as e:
-            log.debug(f"  ⚠️ fetch_open_orders hatası ({symbol}): {e}")
+            # ── ADIM 2: Raw Binance endpoint (GTE / closePosition emirler) ────
+            try:
+                await self.exchange.fapiPrivateDeleteAllOpenOrders({"symbol": raw_sym})
+            except Exception:
+                pass
 
-        # ── ADIM 4: Algo emirleri temizle ─────────────────────────────────────
-        try:
-            open_algo = await self._safe_call(
-                self.exchange.fapiPrivateGetOpenAlgoOrders,
-                {"symbol": raw_sym}
-            )
-            algo_orders = open_algo.get("orders", []) if isinstance(open_algo, dict) else []
-            if algo_orders:
-                await self._safe_call(
-                    self.exchange.fapiPrivateDeleteAlgoOpenOrders,
-                    {"symbol": raw_sym}
-                )
-                cleaned += len(algo_orders)
-        except Exception:
-            pass
+            # Binance matching engine'in işlemi kaydetmesi için bekle
+            await asyncio.sleep(0.6)
 
-        # ── ADIM 5: Binance matching engine'e senkronizasyon süresi ──────────
-        await asyncio.sleep(0.5)
+            # ── ADIM 3: ID bazlı sniper — kalan emirleri tek tek vur ──────────
+            try:
+                open_orders = await self.exchange.fetch_open_orders(symbol)
+                for order in open_orders:
+                    oid = order.get("id")
+                    if not oid:
+                        continue
+                    for _attempt in range(2):  # Her emir için 2 deneme
+                        try:
+                            await self.exchange.cancel_order(oid, symbol)
+                            cleaned += 1
+                            log.debug(f"  🎯 Sniper cancel: {symbol} ID:{oid} iptal edildi")
+                            break
+                        except Exception as e:
+                            if "-2011" in str(e):  # Zaten iptal edilmiş
+                                break
+                            await asyncio.sleep(0.3)
+            except Exception as e:
+                log.debug(f"  ⚠️ fetch_open_orders ({symbol}): {e}")
 
-        if cleaned > 0:
-            log.info(f"  🗑️ Sniper temizlik tamamlandı: {symbol} ({cleaned} emir iptal)")
-        return True
+            # ── ADIM 4: Algo emirler (TWAP / VP) ─────────────────────────────
+            try:
+                open_algo = await self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": raw_sym})
+                algo_list = open_algo.get("orders", []) if isinstance(open_algo, dict) else []
+                if algo_list:
+                    await self.exchange.fapiPrivateDeleteAlgoOpenOrders({"symbol": raw_sym})
+                    cleaned += len(algo_list)
+            except Exception:
+                pass
+
+            await asyncio.sleep(0.4)
+
+            # ── ADIM 5: Doğrulama — hala emir var mı? ────────────────────────
+            try:
+                remaining = await self.exchange.fetch_open_orders(symbol)
+                if not remaining:
+                    if cleaned > 0:
+                        log.info(f"  🗑️ Sniper v5 OK: {symbol} ({cleaned} emir temizlendi)")
+                    return True
+                # Hala emir var — sonraki tura geç
+                if round_num < max_rounds:
+                    log.warning(
+                        f"  ⚠️ {symbol}: {len(remaining)} emir hala açık — "
+                        f"tur {round_num}/{max_rounds}, tekrar deneniyor..."
+                    )
+                    await asyncio.sleep(1.0)
+                else:
+                    log.warning(
+                        f"  ❌ {symbol}: {len(remaining)} emir {max_rounds} turda silinemedi — "
+                        f"RAM SL devreye girecek."
+                    )
+            except Exception:
+                # Doğrulama yapılamadı, iyimser devam et
+                return True
+
+        return False
 
     async def open_short(self, symbol: str, entry_price: float,
                          pump_item: WatchlistItem, equity: float,
@@ -948,13 +992,25 @@ class PumpSnifferBot:
 
             await self._safe_call(self.exchange.set_leverage, pos["leverage"], symbol)
 
+            # Position mode (hedge vs one-way) belirle — emri doğru params ile gönder
+            hedge = await self._detect_position_mode()
+
             # İşlem açılmadan HEMEN ÖNCE eski algo emirleri temizle (-4130 fix)
             await self._cancel_algo_orders(symbol)
+
+            if hedge:
+                open_params = {"positionSide": "SHORT"}
+                sl_params   = {"stopPrice": None, "positionSide": "SHORT",
+                               "closePosition": True, "workingType": "MARK_PRICE"}
+            else:
+                open_params = {"reduceOnly": False}
+                sl_params   = {"stopPrice": None, "closePosition": True,
+                               "workingType": "MARK_PRICE"}
 
             order = await self._safe_call(
                 self.exchange.create_order,
                 symbol, "market", "sell", qty,
-                params={"reduceOnly": False}
+                params=open_params
             )
             order_placed = True  # Market emri başarıyla gönderildi
             log.info(f"  📤 Market SHORT emir: {order.get('id', 'N/A')}")
@@ -962,15 +1018,12 @@ class PumpSnifferBot:
             await self._cancel_algo_orders(symbol)
 
             sl_price = round(pos["sl"], price_prec)
+            sl_params["stopPrice"] = sl_price
             try:
                 await self._safe_call(
                     self.exchange.create_order,
                     symbol, "stop_market", "buy", None,
-                    params={
-                        "stopPrice"    : sl_price,
-                        "closePosition": True,
-                        "workingType"  : "MARK_PRICE",
-                    }
+                    params=sl_params
                 )
                 log.info(f"  🟥 SL koyuldu: {sl_price:.{price_prec}f}")
             except ccxt.ExchangeError as e:
@@ -979,11 +1032,7 @@ class PumpSnifferBot:
                     await self._safe_call(
                         self.exchange.create_order,
                         symbol, "stop_market", "buy", None,
-                        params={
-                            "stopPrice"    : sl_price,
-                            "closePosition": True,
-                            "workingType"  : "MARK_PRICE",
-                        }
+                        params=sl_params
                     )
                 else:
                     raise
@@ -1078,14 +1127,18 @@ class PumpSnifferBot:
 
                 # e) Yeni SL emri gönder
                 try:
+                    hedge = await self._detect_position_mode()
+                    sl_order_params = {
+                        "stopPrice"    : sl_rounded,
+                        "closePosition": True,
+                        "workingType"  : "MARK_PRICE",
+                    }
+                    if hedge:
+                        sl_order_params["positionSide"] = "SHORT"
                     await self._safe_call(
                         self.exchange.create_order,
                         symbol, "stop_market", "buy", None,
-                        params={
-                            "stopPrice"    : sl_rounded,
-                            "closePosition": True,
-                            "workingType"  : "MARK_PRICE",
-                        }
+                        params=sl_order_params
                     )
                     log.info(f"  🔄 SL GÜNCELLENDI (Binance, deneme {attempt}): {symbol}  → {sl_rounded:.{price_prec}f}")
                     # Başarılı SL'i kaydet — gereksiz tekrar güncellemeyi önle
