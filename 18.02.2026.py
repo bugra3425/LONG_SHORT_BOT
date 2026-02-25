@@ -495,6 +495,7 @@ class PumpSnifferBot:
         if not self.active_trades:
             return
         log.info(f"🔍 Startup TSL Kontrolü: {len(self.active_trades)} aktif pozisyon kontrol ediliyor...")
+        await self._safe_call(self.exchange.load_markets)  # market precision için gerekli
         hedge = await self._detect_position_mode()
         for sym, trade in list(self.active_trades.items()):
             try:
@@ -524,15 +525,17 @@ class PumpSnifferBot:
                         qty = abs(float(p.get("contracts", 0)))
                         break
                 if qty <= 0:
-                    log.debug(f"  ⏩ {sym}: Açık pozisyon yok, atlandı")
+                    log.warning(f"  ⚠️ {sym}: Binance'te açık pozisyon bulunamadı — TSL atlandı")
                     continue
                 mkt = self.exchange.markets.get(sym, {})
-                pp  = get_digits(mkt.get("precision", {}).get("price"))
+                pp  = get_digits(mkt.get("precision", {}).get("price")) or 6
+                ap  = get_digits(mkt.get("precision", {}).get("amount")) or 4
+                qty = round(qty, ap)
                 act = round(
                     trade.entry_price * (1 - Config.TSL_ACTIVATION_DROP_PCT / 100.0), pp
                 )
                 if act >= trade.entry_price:
-                    log.error(f"  ❌ {sym}: TSL aktivasyon yönü hatalı, atlandı")
+                    log.error(f"  ❌ {sym}: TSL aktivasyon yönü hatalı ({act} >= {trade.entry_price}), atlandı")
                     continue
 
                 # Mevcut fiyatı al — aktivasyon zaten geçildiyse activationPrice gönderme
@@ -546,43 +549,41 @@ class PumpSnifferBot:
                     "callbackRate": Config.TSL_TRAIL_PCT,
                     "workingType" : "MARK_PRICE",
                 }
-                # BUY trailing stop: activationPrice mevcut fiyatın ALTINDA olmalı
-                # Eğer fiyat zaten aktivasyon seviyesinin altına inmişse → activationPrice koyma (anında aktif)
                 if current_price > 0 and act < current_price:
                     tsl_params["activationPrice"] = act
-                    log.info(f"  📍 {sym}: Aktivasyon henüz tetiklenmedi ({act:.{pp}f} > {current_price:.{pp}f})")
+                    log.info(f"  📍 {sym}: qty={qty} | entry={trade.entry_price} | act={act:.{pp}f} | cur={current_price:.{pp}f}")
                 else:
-                    log.info(f"  ⚡ {sym}: Fiyat aktivasyonu geçti ({current_price:.{pp}f} < {act:.{pp}f}) → TSL anında aktif")
+                    log.info(f"  ⚡ {sym}: Fiyat aktivasyonu geçti ({current_price:.{pp}f} < {act:.{pp}f}) → TSL anında aktif | qty={qty}")
                 if hedge:
                     tsl_params["positionSide"] = "SHORT"
                 else:
                     tsl_params["reduceOnly"] = True
-                await self.exchange.create_order(
-                    symbol=sym,
-                    type="TRAILING_STOP_MARKET",
-                    side="buy",
-                    amount=qty,
-                    price=None,
-                    params=tsl_params
-                )
-                trade.tsl_placed = True
-                log.info(
-                    f"  🔧 {sym}: TSL EKLENdİ — "
-                    f"aktivasyon={act:.{pp}f} | callback=%{Config.TSL_TRAIL_PCT}"
-                )
-                # TSL koyuldu — eski STOP_MARKET gereksiz, temizle
-                await self._cancel_only_stop_market(sym)
-                log.info(f"  🧹 {sym} başlatış TSL sonrası STOP_MARKET iptal edildi")
+
+                log.info(f"  📤 {sym}: TSL emri gönderiliyor... params={tsl_params}")
                 try:
-                    notifier.send(
-                        f"🔧 Başlatışta TSL Eklendi\n🪙 {sym}\n"
-                        f"🎯 Aktivasyon: {act:.{pp}f}\n"
-                        f"📏 Callback: %{Config.TSL_TRAIL_PCT}"
+                    await self.exchange.create_order(
+                        symbol=sym,
+                        type="TRAILING_STOP_MARKET",
+                        side="buy",
+                        amount=qty,
+                        price=None,
+                        params=tsl_params
                     )
-                except Exception:
-                    pass
+                    trade.tsl_placed = True
+                    log.info(f"  🔧 {sym}: TSL EKLENdİ — aktivasyon={act:.{pp}f} | callback=%{Config.TSL_TRAIL_PCT}")
+                    await self._cancel_only_stop_market(sym)
+                    try:
+                        notifier.send(
+                            f"🔧 Başlatışta TSL Eklendi\n🪙 {sym}\n"
+                            f"🎯 Aktivasyon: {act:.{pp}f}\n"
+                            f"📏 Callback: %{Config.TSL_TRAIL_PCT}"
+                        )
+                    except Exception:
+                        pass
+                except Exception as tsl_err:
+                    log.error(f"  ❌ {sym}: TSL create_order HATASI: {tsl_err}")
             except Exception as e:
-                log.warning(f"  ⚠️ {sym} startup TSL hatası: {e}")
+                log.error(f"  ❌ {sym} startup TSL genel hatası: {e}")
         self._save_state()
 
     async def _cleanup_orphan_orders(self):
