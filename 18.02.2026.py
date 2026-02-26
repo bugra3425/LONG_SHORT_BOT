@@ -1275,48 +1275,8 @@ class PumpSnifferBot:
                 else:
                     raise
 
-            # ── Binance Native TRAILING_STOP_MARKET (Tek Blok) ──────────────
-            if not trade.tsl_placed:
-                activation_price = round(
-                    entry_price * (1 - Config.TSL_ACTIVATION_DROP_PCT / 100.0),
-                    price_prec
-                )
-                # GÜVENLİK ZIRHI: SHORT aktivasyonu girişten YÜKSEK OLAMAZ
-                if activation_price >= entry_price:
-                    log.error(
-                        f"  ❌ {symbol} TSL Aktivasyon Hatası: "
-                        f"{activation_price} >= {entry_price} — TSL koyulmadı!"
-                    )
-                else:
-                    tsl_params = {
-                        "activationPrice": activation_price,
-                        "callbackRate"   : Config.TSL_TRAIL_PCT,
-                        "workingType"    : "MARK_PRICE",
-                    }
-                    if hedge:
-                        tsl_params["positionSide"] = "SHORT"
-                    else:
-                        tsl_params["reduceOnly"] = True
-                    try:
-                        await self.exchange.create_order(
-                            symbol=symbol,
-                            type="TRAILING_STOP_MARKET",
-                            side="buy",
-                            amount=qty,
-                            price=None,
-                            params=tsl_params
-                        )
-                        trade.tsl_placed = True
-                        log.info(
-                            f"  🎯 {symbol} NATIVE TSL AKTİF! "
-                            f"Düşüş Hedefi: {activation_price:.{price_prec}f} | "
-                            f"Takip: %{Config.TSL_TRAIL_PCT}"
-                        )
-                        # TSL koyuldu — artık STOP_MARKET gereksiz, temizle
-                        await self._cancel_only_stop_market(symbol)
-                        log.info(f"  🧹 {symbol} STOP_MARKET iptal edildi (TSL aktif)")
-                    except Exception as e:
-                        log.error(f"  ❌ {symbol} TSL Emri Gönderilemedi: {e}")
+            # TSL artık open_short'ta değil → manage_open_trades'te
+            # drop_pct >= TSL_ACTIVATION_DROP_PCT olunca koyulacak.
 
         except Exception as e:
             log.error(f"  ❌ Emir gönderilemedi ({symbol}): {e}")
@@ -1331,7 +1291,7 @@ class PumpSnifferBot:
             f"  ✅ SHORT AÇILDI [{('DEMO 🧪' if Config.DEMO_MODE else 'CANLI ⚠️')}]: {symbol}\n"
             f"     Giriş : {entry_price:.6f}\n"
             f"     SL    : {pos['sl']:.6f}  (+{Config.SL_ABOVE_ENTRY_PCT}% giriş üstü)\n"
-            f"     TSL   : aktivasyon=%{Config.TSL_ACTIVATION_DROP_PCT}  callbackRate=%{Config.TSL_TRAIL_PCT}  (Binance native)\n"
+            f"     TSL   : %{Config.TSL_ACTIVATION_DROP_PCT} düşüşte koyulacak  (callback=%{Config.TSL_TRAIL_PCT})\n"
             f"     Boyut : {pos['position_size_usdt']:.4f} USDT  "
             f"(x{pos['leverage']} → {pos['notional_usdt']:.4f} notional)"
         )
@@ -1542,32 +1502,38 @@ class PumpSnifferBot:
             log.debug(f"  ⚠️ _cancel_only_stop_market hatası ({symbol}): {e}")
 
     # ─────────────────────────────────────────────────────────────────
-    # 2.3.3  TRADE YÖNETİMİ (Fiziksel Binance Emirleriyle)
+    # 2.3.3  TRADE YÖNETİMİ — ATEŞLE VE UNUT (Fire & Forget v6.0)
     # ─────────────────────────────────────────────────────────────────
 
     async def manage_open_trades(self, equity: float):
         """
-        The Shadow Tracker v5.0 — BINANCE NATIVE TRAILING STOP.
+        Fire & Forget v6.0 — ATEŞLE VE UNUT MİMARİSİ.
 
-        DEĞİŞİKLİKLER (v5.0):
-          • Manuel dip takibi KALDIRILDI  → Binance'in TRAILING_STOP_MARKET emri kullanılıyor
-          • KURAL-3 cancel/replace döngüsü KALDIRILDI → bot artık 5sn'de bir stop silip koymuyor
-          • Breakeven aşamasında sadece STOP_MARKET güncelleniyor, TRAILING_STOP_MARKET'e dokunulmuyor
+        ADIM C — KAPANAN POZİSYON TESPİTİ:
+          fetch_positions ile pozisyon açık mı kontrol et.
+          Kapanmışsa (SL/TSL tetiklendi) → PnL hesapla, temizle.
 
-        Stage 1 — Breakeven  : %{BREAKEVEN_DROP_PCT} düşüşte sadece STOP_MARKET = entry'e çekilir
-        Stage 2 — TSL Log    : %{TSL_ACTIVATION_DROP_PCT}'e ulaşınca log — Binance kendi trailing'i yönetir
-        Stage 3 — SL Kontrol : RAM'deki SL >= current_price → acil kapatma (failsafe)
-        Stage 4 — Yeşil Mum  : Zararda yeşil mum kapanışı → GREEN-10 / 2xGREEN-LOSS çıkışı
+        ADIM B — DOKUNULMAZLIK KALKANI:
+          tsl_placed = True → Binance native TSL yönetiyor, hiçbir stage çalışmaz.
 
-        Stage 1-3: TICKER (mark/last price) kullanır — OHLCV çekmez.
-        Stage 4  : Sadece bu aşamada OHLCV çeker (kapanmış mum kontrolü).
+        Stage 1 — BREAKEVEN:
+          Düşüş >= %BREAKEVEN_DROP_PCT → Binance STOP_MARKET entry'e çekilir.
+
+        ADIM A — TSL GÖNDERİMİ:
+          Düşüş >= %TSL_ACTIVATION_DROP_PCT → eski SL iptal, TRAILING_STOP_MARKET koyulur.
+          tsl_placed = True → Kalkan devreye girer, bot artık dokunmaz.
+
+        Stage 4 — YEŞİL MUM ÇIKIŞI:
+          Zararda yeşil mum kapanışı → GREEN-10 / 2xGREEN-LOSS çıkışı.
+          (Sadece TSL koyulmadan ÖNCE çalışır.)
+
+        RAM tabanlı SL takibi YOK — tüm SL/TSL Binance'te.
         """
         closed = []
 
-        # ── KURAL 1: Async-safe iterasyon ──────────────────────────────
         for sym, trade in list(self.active_trades.items()):
             try:
-                # ── KURAL 2: OHLCV yerine TICKER — anlık mark/last price ──
+                # ── Anlık fiyat ──────────────────────────────────────────
                 ticker = await self._safe_call(self.exchange.fetch_ticker, sym)
                 if not ticker:
                     continue
@@ -1576,146 +1542,37 @@ class PumpSnifferBot:
                     continue
                 current_price = float(current_price)
 
-                # ── 🛡️ TSL DOKUNULMAZLIK KALKANI ─────────────────────────────
-                # Native TSL Binance'e emanet edildiyse bot müdahale ETMEZ.
-                # Ama pozisyon kapandıysa (TSL tetiklendiyse) active_trades'den sil.
-                if getattr(trade, "tsl_placed", False):
-                    try:
-                        pos_list = await self._safe_call(
-                            self.exchange.fetch_positions, [sym]
-                        )
-                        still_open = any(
-                            abs(float(p.get("contracts") or 0)) > 0
-                            for p in (pos_list or [])
-                            if p.get("symbol") == sym
-                        )
-                    except Exception:
-                        still_open = True  # Hata varsa dokunma
-                    if not still_open:
-                        log.info(
-                            f"  ✅ {sym}: TSL tetiklendi → pozisyon kapandı, kayıt silindi"
-                        )
-                        try:
-                            notifier.notify_trade_close(
-                                sym, "NATIVE-TSL", trade.pnl_pct, trade.pnl_usdt
-                            )
-                        except Exception:
-                            pass
-                        closed.append(sym)
-                    continue
-
-                # ── Stage 1: Breakeven — düşüş >= %BREAKEVEN_DROP_PCT ─────────
-                # Sadece STOP_MARKET entry'e çekilir. TRAILING_STOP_MARKET'e dokunulmaz.
-                if not trade.breakeven_triggered:
-                    drop_pct = (trade.entry_price - current_price) / trade.entry_price * 100.0
-                    if drop_pct >= Config.BREAKEVEN_DROP_PCT:
-                        trade.stop_loss = trade.entry_price
-                        trade.breakeven_triggered = True
-                        trade.sl_moved_to_be = True
-                        log.info(f"  ⚡ BREAKEVEN: {sym}  Düşüş: %{drop_pct:.1f}  "
-                                 f"SL → {trade.entry_price:.6f}")
-                        try:
-                            notifier.send(f"⚡ BREAKEVEN\n🪙 {sym}\n📉 Düşüş: {drop_pct:.1f}%\n🛡️ SL → Giriş fiyatı")
-                        except Exception:
-                            pass
-                        # STOP_MARKET'i entry'e çek — TSL'e dokunma
-                        try:
-                            mkt_info   = self.exchange.markets.get(sym, {})
-                            price_prec = get_digits(mkt_info.get("precision", {}).get("price"))
-                            amt_prec   = get_digits(mkt_info.get("precision", {}).get("amount"))
-                            sl_rounded = round(trade.entry_price, price_prec)
-                            hedge_be   = await self._detect_position_mode()
-                            # Pozisyon miktarını Binance'ten al
-                            _pos_list = await self._safe_call(self.exchange.fetch_positions, [sym])
-                            _be_qty = 0.0
-                            for _pp in (_pos_list or []):
-                                if _pp.get("symbol") == sym:
-                                    _be_qty = abs(float(_pp.get("contracts", 0)))
-                                    break
-                            if _be_qty <= 0:
-                                log.warning(f"  ⚠️ BE: {sym} pozisyon miktarı alınamadı")
-                                return
-                            _be_qty = round(_be_qty, amt_prec)
-                            await self._cancel_only_stop_market(sym)
-                            await asyncio.sleep(0.3)
-                            # closePosition:True yerine reduceOnly+qty — TSL ile çakışmaz
-                            be_params = {"stopPrice": sl_rounded, "workingType": "MARK_PRICE"}
-                            if hedge_be:
-                                be_params["positionSide"] = "SHORT"
-                            else:
-                                be_params["reduceOnly"] = True
-                            await self._safe_call(
-                                self.exchange.create_order,
-                                sym, "stop_market", "buy", _be_qty,
-                                params=be_params
-                            )
-                            log.info(f"  🟡 BE SL Binance'e gönderildi: {sl_rounded:.{price_prec}f}")
-                        except Exception as be_err:
-                            log.warning(f"  ⚠️ BE SL güncellenemedi ({sym}): {be_err}")
-
-                # ── Stage 2: TSL Aktivasyon TakiBİ (BİLGİ) ──────────────────────
-                # Binance native TRAILING_STOP_MARKET çalışıyor — bot sadece loglama yapar.
-                drop_pct = (trade.entry_price - current_price) / trade.entry_price * 100.0
-                if not trade.tsl_active and drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
-                    trade.tsl_active = True
-                    trade.lowest_low_reached = current_price
-                    log.info(
-                        f"  🎯 TSL AKTİF (Binance native): {sym}  Düşüş: %{drop_pct:.1f}  "
-                        f"callbackRate=%{Config.TSL_TRAIL_PCT}"
+                # ══════════════════════════════════════════════════════════
+                # ADIM C: KAPANAN POZİSYON TESPİTİ
+                # ══════════════════════════════════════════════════════════
+                try:
+                    pos_list = await self._safe_call(
+                        self.exchange.fetch_positions, [sym]
                     )
+                    open_qty = 0.0
+                    for p in (pos_list or []):
+                        if p.get("symbol") == sym:
+                            open_qty = abs(float(p.get("contracts") or 0))
+                            break
+                except Exception:
+                    open_qty = -1  # Hata → güvenli tarafta kal, dokunma
+
+                if open_qty == 0:
+                    # ── Pozisyon kapanmış — gerçek çıkış fiyatını bul ──
+                    exit_p = current_price
                     try:
-                        notifier.send(
-                            f"🎯 TSL AKTİF\n🪙 {sym}\n📉 Düşüş: {drop_pct:.1f}%\n"
-                            f"🛡️ Binance trailing takipte (callback %{Config.TSL_TRAIL_PCT})"
+                        recent = await self._safe_call(
+                            self.exchange.fetch_my_trades, sym, limit=5
                         )
+                        if recent:
+                            exit_p = float(recent[-1].get("price", current_price))
                     except Exception:
                         pass
-                elif trade.tsl_active and current_price < trade.lowest_low_reached:
-                    trade.lowest_low_reached = current_price
-                    log.debug(f"  📉 {sym} TSL yeni dip izleniyor: {current_price:.6f}")
 
-                # ── Stage 3: SL-Hit Kontrolü (RAM failsafe) ──────────────────────
-                # Binance native TSL/SL tetiklenince pozisyon kapanır.
-                # Buradaki kontrol: Binance'in SL'i tetiklemediği senaryolara karşı güvence.
-                # current_price >= trade.stop_loss → acil kapatma
-                if current_price >= trade.stop_loss:
-                    # Binance'te gerçek pozisyon var mı kontrol et
-                    real_exit_price = None
-                    try:
-                        positions = await self._safe_call(self.exchange.fetch_positions, [sym])
-                        has_position = False
-                        for pos in positions:
-                            if pos.get("symbol") == sym and abs(float(pos.get("contracts", 0))) > 0:
-                                has_position = True
-                                break
-                        if has_position:
-                            # KURAL 3: Önce temizle, sonra kapat
-                            await self._cancel_algo_orders(sym, retry=True)
-                            await asyncio.sleep(0.2)
-                            await self._market_close_position(sym)
-                        else:
-                            # Binance SL zaten tetiklenmiş — gerçek çıkış fiyatını al
-                            log.info(f"  ℹ️ {sym}: Pozisyon zaten Binance SL ile kapanmış.")
-                            try:
-                                recent_trades = await self._safe_call(
-                                    self.exchange.fetch_my_trades, sym, limit=5
-                                )
-                                if recent_trades:
-                                    last_t = recent_trades[-1]
-                                    real_exit_price = float(last_t.get("price", current_price))
-                            except Exception:
-                                pass
-                            # Yine de orphan emirleri temizle
-                            await self._cancel_algo_orders(sym, retry=False)
-                    except Exception:
-                        await self._cancel_algo_orders(sym, retry=True)
-                        await asyncio.sleep(0.2)
-                        await self._market_close_position(sym)
-
-                    exit_p  = real_exit_price if real_exit_price else current_price
                     pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
                     pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
-                    reason  = "TSL-HIT" if trade.tsl_active else "STOP-LOSS"
+                    reason  = "NATIVE-TSL" if trade.tsl_placed else "STOP-LOSS"
+
                     trade.exit_time   = datetime.now(timezone.utc).isoformat()
                     trade.exit_price  = exit_p
                     trade.exit_reason = reason
@@ -1725,15 +1582,130 @@ class PumpSnifferBot:
                     closed.append(sym)
                     self._post_exit_price[sym] = exit_p
                     self._new_push[sym] = False
-                    log.info(f"  🔴 {reason}: {sym}  |  PnL: {trade.pnl_usdt:+.2f} USDT")
+
+                    # Kalan orphan emirleri temizle
+                    await self._cancel_algo_orders(sym, retry=False)
+
+                    log.info(
+                        f"  ✅ {sym}: Pozisyon kapandı ({reason}) | "
+                        f"Çıkış: {exit_p:.6f} | PnL: {trade.pnl_usdt:+.2f} USDT"
+                    )
                     try:
                         notifier.notify_trade_close(sym, reason, trade.pnl_pct, trade.pnl_usdt)
                     except Exception:
                         pass
-                    continue  # Stage 3'te kapandı — Stage 4'e geçme
+                    continue
 
-                # ── KURAL 4: Stage 4 İZOLASYONU — Sadece burada OHLCV çek ─────
-                # İşlem hâlâ açık → kapanmış mum kontrolü için minimal OHLCV
+                if open_qty < 0:
+                    continue  # fetch_positions hatası → bu döngüde atla
+
+                # ══════════════════════════════════════════════════════════
+                # ADIM B: DOKUNULMAZLIK KALKANI
+                # ══════════════════════════════════════════════════════════
+                if trade.tsl_placed:
+                    continue  # Native TSL Binance'te — bot müdahale ETMEZ
+
+                # ── Düşüş yüzdesi (SHORT → fiyat düştükçe kâr) ──────────
+                drop_pct = (trade.entry_price - current_price) / trade.entry_price * 100.0
+
+                # ══════════════════════════════════════════════════════════
+                # STAGE 1: BREAKEVEN — düşüş >= %BREAKEVEN_DROP_PCT
+                # ══════════════════════════════════════════════════════════
+                if not trade.breakeven_triggered and drop_pct >= Config.BREAKEVEN_DROP_PCT:
+                    trade.stop_loss = trade.entry_price
+                    trade.breakeven_triggered = True
+                    trade.sl_moved_to_be = True
+                    log.info(
+                        f"  ⚡ BREAKEVEN: {sym}  Düşüş: %{drop_pct:.1f}  "
+                        f"SL → {trade.entry_price:.6f}"
+                    )
+                    try:
+                        notifier.send(
+                            f"⚡ BREAKEVEN\n🪙 {sym}\n"
+                            f"📉 Düşüş: {drop_pct:.1f}%\n🛡️ SL → Giriş fiyatı"
+                        )
+                    except Exception:
+                        pass
+                    # Binance STOP_MARKET'i entry'e çek
+                    try:
+                        mkt_info   = self.exchange.markets.get(sym, {})
+                        price_prec = get_digits(mkt_info.get("precision", {}).get("price"))
+                        amt_prec   = get_digits(mkt_info.get("precision", {}).get("amount"))
+                        sl_rounded = round(trade.entry_price, price_prec)
+                        hedge_be   = await self._detect_position_mode()
+                        _be_qty    = round(open_qty, amt_prec)
+                        await self._cancel_only_stop_market(sym)
+                        await asyncio.sleep(0.3)
+                        be_params = {"stopPrice": sl_rounded, "workingType": "MARK_PRICE"}
+                        if hedge_be:
+                            be_params["positionSide"] = "SHORT"
+                        else:
+                            be_params["reduceOnly"] = True
+                        await self._safe_call(
+                            self.exchange.create_order,
+                            sym, "stop_market", "buy", _be_qty,
+                            params=be_params
+                        )
+                        log.info(f"  🟡 BE SL gönderildi: {sl_rounded:.{price_prec}f}")
+                    except Exception as be_err:
+                        log.warning(f"  ⚠️ BE SL hatası ({sym}): {be_err}")
+
+                # ══════════════════════════════════════════════════════════
+                # ADIM A: TSL GÖNDERİMİ — düşüş >= %TSL_ACTIVATION_DROP_PCT
+                # ══════════════════════════════════════════════════════════
+                if drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
+                    # 1) Eski BE/SL emirlerini temizle
+                    await self._cancel_algo_orders(sym, retry=True)
+                    await asyncio.sleep(0.3)
+
+                    # 2) Precision bilgisi
+                    mkt = self.exchange.markets.get(sym, {})
+                    pp  = get_digits(mkt.get("precision", {}).get("price")) or 6
+                    ap  = get_digits(mkt.get("precision", {}).get("amount")) or 4
+                    qty = round(open_qty, ap)
+
+                    # 3) Hedge / One-way mode
+                    hedge = await self._detect_position_mode()
+                    tsl_params = {
+                        "callbackRate": Config.TSL_TRAIL_PCT,
+                        "workingType" : "MARK_PRICE",
+                    }
+                    if hedge:
+                        tsl_params["positionSide"] = "SHORT"
+                    else:
+                        tsl_params["reduceOnly"] = True
+
+                    # 4) TRAILING_STOP_MARKET gönder
+                    #    activationPrice YOK — fiyat zaten düştü, TSL anında aktif
+                    try:
+                        await self.exchange.create_order(
+                            symbol=sym,
+                            type="TRAILING_STOP_MARKET",
+                            side="buy",
+                            amount=qty,
+                            price=None,
+                            params=tsl_params
+                        )
+                        trade.tsl_placed = True
+                        log.info(
+                            f"  🎯 TSL KOYULDU: {sym} | Düşüş: %{drop_pct:.1f} | "
+                            f"callback=%{Config.TSL_TRAIL_PCT} | qty={qty}"
+                        )
+                        try:
+                            notifier.send(
+                                f"🎯 TSL AKTİF\n🪙 {sym}\n"
+                                f"📉 Düşüş: {drop_pct:.1f}%\n"
+                                f"📏 Callback: %{Config.TSL_TRAIL_PCT}"
+                            )
+                        except Exception:
+                            pass
+                    except Exception as tsl_err:
+                        log.error(f"  ❌ TSL gönderilemedi ({sym}): {tsl_err}")
+                    continue  # TSL koyuldu → Stage 4'e geçme
+
+                # ══════════════════════════════════════════════════════════
+                # STAGE 4: YEŞİL MUM ÇIKIŞI (TSL koyulmadan önce çalışır)
+                # ══════════════════════════════════════════════════════════
                 try:
                     df_raw = await self.fetch_ohlcv(sym, Config.TIMEFRAME, limit=3)
                     if df_raw.empty:
@@ -1745,15 +1717,18 @@ class PumpSnifferBot:
                 except Exception:
                     continue
 
-                # Aynı kapanmış mumu tekrar saymamak için timestamp kontrolü
                 candle_ts = str(df_closed.index[-1])
                 if candle_ts == trade._last_checked_ts:
                     pass  # Bu mum zaten değerlendirildi
-                elif closed_candle["close"] > closed_candle["open"] and closed_candle["close"] > trade.entry_price:
+                elif (closed_candle["close"] > closed_candle["open"]
+                      and closed_candle["close"] > trade.entry_price):
                     trade._last_checked_ts = candle_ts
-                    green_body_pct = (closed_candle["close"] - closed_candle["open"]) / closed_candle["open"] * 100.0
+                    green_body_pct = (
+                        (closed_candle["close"] - closed_candle["open"])
+                        / closed_candle["open"] * 100.0
+                    )
 
-                    # Zararda tek yeşil mum gövdesi >= %GREEN_LOSS_SINGLE_BODY_PCT → anında kapat
+                    # Tek yeşil mum gövdesi >= %GREEN_LOSS_SINGLE_BODY_PCT → kapat
                     if green_body_pct >= Config.GREEN_LOSS_SINGLE_BODY_PCT:
                         exit_p  = closed_candle["close"]
                         pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
@@ -1767,11 +1742,13 @@ class PumpSnifferBot:
                         closed.append(sym)
                         self._post_exit_price[sym] = exit_p
                         self._new_push[sym] = False
-                        # Önce temizle, sonra kapat
                         await self._cancel_algo_orders(sym, retry=True)
                         await asyncio.sleep(0.2)
                         await self._market_close_position(sym)
-                        log.info(f"  🟠 GREEN-10: {sym}  Gövde: %{green_body_pct:.1f}  Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT")
+                        log.info(
+                            f"  🟠 GREEN-10: {sym}  Gövde: %{green_body_pct:.1f}  "
+                            f"Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT"
+                        )
                         try:
                             notifier.notify_trade_close(sym, "GREEN-10", trade.pnl_pct, trade.pnl_usdt)
                         except Exception:
@@ -1793,11 +1770,13 @@ class PumpSnifferBot:
                         closed.append(sym)
                         self._post_exit_price[sym] = exit_p
                         self._new_push[sym] = False
-                        # Önce temizle, sonra kapat
                         await self._cancel_algo_orders(sym, retry=True)
                         await asyncio.sleep(0.2)
                         await self._market_close_position(sym)
-                        log.info(f"  🟠 2xGREEN-LOSS: {sym}  Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT")
+                        log.info(
+                            f"  🟠 2xGREEN-LOSS: {sym}  "
+                            f"Close: {exit_p:.6f}  PnL: {trade.pnl_usdt:+.2f} USDT"
+                        )
                         try:
                             notifier.notify_trade_close(sym, "2xGREEN-LOSS", trade.pnl_pct, trade.pnl_usdt)
                         except Exception:
@@ -1805,7 +1784,7 @@ class PumpSnifferBot:
                         continue
                 else:
                     trade._last_checked_ts = candle_ts
-                    trade.consec_green_loss = 0  # Kırmızı veya kârda yeşil → sayacı sıfırla
+                    trade.consec_green_loss = 0
 
             except Exception as e:
                 log.error(f"  Trade yönetim hatası ({sym}): {e}")
