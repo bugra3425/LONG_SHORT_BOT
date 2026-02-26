@@ -308,7 +308,8 @@ class Config:
     # ── Module 3 — TRADE MANAGEMENT ─────────────────────────────────
     LEVERAGE                     = _p("LEVERAGE",                    3)
     MAX_ACTIVE_TRADES            = _p("MAX_ACTIVE_TRADES",           5)
-    RISK_PER_TRADE_PCT           = _p("RISK_PER_TRADE_PCT",          0.5)
+    MARGIN_PER_TRADE_PCT         = _p("MARGIN_PER_TRADE_PCT",        20.0)  # Bakiyenin %20'si = equity / 5
+    RISK_PER_TRADE_PCT           = _p("RISK_PER_TRADE_PCT",          0.5)  # ⚠️ DEPRECATED - MARGIN_PER_TRADE_PCT kullanılıyor
     SL_ABOVE_ENTRY_PCT           = _p("SL_ABOVE_ENTRY_PCT",          2.5)
     BREAKEVEN_DROP_PCT           = _p("BREAKEVEN_DROP_PCT",          1.5)
     TSL_ACTIVATION_DROP_PCT      = _p("TSL_ACTIVATION_DROP_PCT",     5.0)
@@ -705,20 +706,23 @@ class PumpSnifferBot:
         """
         Module 3: Pozisyon büyüklüğü ve SL hesapla.
 
-        KESİN ORANSAL BOYUTLAMA — bakiyeden bağımsız:
-          pos_margin = equity / MAX_ACTIVE_TRADES  (%20 sabit dilim)
-          leverage   = Config.LEVERAGE             (daima 3x, asla artmaz)
+        SABİT %20 MARGİN SİSTEMİ — Bakiye ne olursa olsun daima %20 kullanılır:
+          pos_margin = equity * (MARGIN_PER_TRADE_PCT / 100.0)  ← Bakiyenin tam %20'si
+          notional   = pos_margin * leverage                     ← Marjin × kaldıraç
+          qty        = notional / entry_price                    ← Alınacak miktar
 
         Örnekler:
-          equity=1000$ → marjin=200$, notional=600$
-          equity=200$  → marjin=40$,  notional=120$
-          equity=100$  → marjin=20$,  notional=60$
+          equity=5000$ → margin=1000$, notional=3000$ (3x kaldıraç)
+          equity=1000$ → margin=200$,  notional=600$
+          equity=200$  → margin=40$,   notional=120$
+          equity=100$  → margin=20$,   notional=60$
 
-        NOT: Sadece Binance MIN_NOTIONAL (5$) kontrolü caller tarafında yapılır.
+        NOT: Bakiye ne olursa olsun kaldıraç SABİT Config.LEVERAGE (3x).
+             Minimum notional kontrolü caller tarafında yapılır.
         """
-        leverage   = Config.LEVERAGE  # Sabit 3x — düşen bakiyede artırılmaz
+        leverage   = Config.LEVERAGE  # Sabit 3x — asla değişmez
         sl         = entry_price * (1 + Config.SL_ABOVE_ENTRY_PCT / 100.0)
-        pos_margin = equity / Config.MAX_ACTIVE_TRADES  # Her zaman %20 dilim
+        pos_margin = equity * (Config.MARGIN_PER_TRADE_PCT / 100.0)  # Bakiyenin tam %20'si
         notional   = pos_margin * leverage
         qty        = notional / entry_price if entry_price > 0 else 0
 
@@ -2076,35 +2080,27 @@ class Backtester:
                     log.info(f"  [{bar_time}] ⛔ SLOT DOLU — ilk kırmızı kaçırıldı: {sym} — sinyal iptal")
                     continue
 
-                # Dinamik kaldıraç: 100-200$ arası → 4x, 200$+ → 3x
-                lev = 4 if equity < 200.0 else Config.LEVERAGE
-
-                # SL: Giriş fiyatının %15 üstü (entry × 1.15)
-                sl = entry_p * (1 + Config.SL_ABOVE_ENTRY_PCT / 100.0)
-
-                # Pozisyon büyüklüğü
-                if equity < 200.0:
-                    pos_margin = equity  # Tek pozisyon, tüm equity
-                else:
-                    pos_margin = equity / Config.MAX_ACTIVE_TRADES
+                # Pozisyon hesaplama: calculate_position (sabit %20 margin, sabit 3x kaldıraç)
+                pos = self.calculate_position(equity, entry_p, pi_saved["pump_high"])
+                sl = pos["sl"]
 
                 trade = TradeRecord(
                     symbol=sym, side="SHORT",
                     entry_time=bar_time, entry_price=entry_p,
                     stop_loss=sl, initial_stop_loss=sl,
                     tp1_price=0.0, tp2_price=0.0,
-                    position_size_usdt=pos_margin, remaining_pct=1.0,
+                    position_size_usdt=pos["position_size_usdt"], remaining_pct=1.0,
                     pump_pct=pi_saved["pump_pct"],
                     pump_high=pi_saved["pump_high"],
                     pump_low=pi_saved["pump_low"],
                     entry_candle_open=bar["open"],
-                    leverage=lev,
+                    leverage=pos["leverage"],
                 )
                 active[sym] = trade
                 max_concurrent = max(max_concurrent, len(active))
                 log.info(f"  [{bar_time}] ✅ SHORT: {sym}  "
                          f"Giriş: {entry_p:.6f}  SL: {sl:.6f}  "
-                         f"Pump: +{pi_saved['pump_pct']:.1f}%  Kaldıraç: x{lev}")
+                         f"Pump: +{pi_saved['pump_pct']:.1f}%  Kaldıraç: x{pos['leverage']}")
 
         # ── Backtest sonu: açık kalan trade'leri kapat ────────────────
         for sym, trade in active.items():
@@ -2704,17 +2700,9 @@ class FullUniverseBacktester:
                     print(f"\n  [{bar_str}] ⛔ SLOT DOLU — ilk kırmızı kaçırıldı: {sym} — sinyal iptal")
                     continue
 
-                # Dinamik kaldıraç: 100-200$ arası → 4x, 200$+ → 3x
-                lev = 4 if equity < 200.0 else Config.LEVERAGE
-
-                # SL: Giriş fiyatının %15 üstü (entry × 1.15)
-                sl = entry_p * (1 + Config.SL_ABOVE_ENTRY_PCT / 100.0)
-
-                # Pozisyon büyüklüğü
-                if equity < 200.0:
-                    pos_margin = equity  # Tek pozisyon, tüm equity
-                else:
-                    pos_margin = equity / Config.MAX_ACTIVE_TRADES
+                # Pozisyon hesaplama: calculate_position (sabit %20 margin, sabit 3x kaldıraç)
+                pos = self.calculate_position(equity, entry_p, pump_info["pump_high"])
+                sl = pos["sl"]
 
                 trade = TradeRecord(
                     symbol             = sym,
@@ -2725,13 +2713,13 @@ class FullUniverseBacktester:
                     initial_stop_loss  = sl,
                     tp1_price          = 0.0,
                     tp2_price          = 0.0,
-                    position_size_usdt = pos_margin,
+                    position_size_usdt = pos["position_size_usdt"],
                     remaining_pct      = 1.0,
                     pump_pct           = pump_info["pump_pct"],
                     pump_high          = pump_info["pump_high"],
                     pump_low           = pump_info["pump_low"],
                     entry_candle_open  = bar["open"],
-                    leverage           = lev,
+                    leverage           = pos["leverage"],
                 )
                 active[sym] = trade
                 max_concurrent = max(max_concurrent, len(active))
