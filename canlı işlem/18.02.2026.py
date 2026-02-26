@@ -283,36 +283,36 @@ class Config:
         # Major-cap coinleri hariç tut
         "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE",
     }
-    PUMP_MIN_PCT                 = _p("PUMP_MIN_PCT",                30.0)
-    TOP_N_GAINERS                = _p("TOP_N_GAINERS",               10)
-    SCAN_INTERVAL_SEC            = _p("SCAN_INTERVAL_SEC",           int(os.environ.get("SCAN_INTERVAL_SECONDS", "600")))
+    PUMP_MIN_PCT                 = _p("PUMP_MIN_PCT",                3.0)
+    TOP_N_GAINERS                = _p("TOP_N_GAINERS",               15)
+    SCAN_INTERVAL_SEC            = _p("SCAN_INTERVAL_SEC",           60)
     MANAGER_INTERVAL_SEC         = _p("MANAGER_INTERVAL_SEC",        5)
-    WATCHLIST_CHECK_INTERVAL_SEC = _p("WATCHLIST_CHECK_INTERVAL_SEC", int(os.environ.get("WATCHLIST_CHECK_SECONDS", "60")))
+    WATCHLIST_CHECK_INTERVAL_SEC = _p("WATCHLIST_CHECK_INTERVAL_SEC", 15)
 
     # ── Module 2 — TRIGGER (Pure Price Action) ───────────────────────
-    TIMEFRAME                    = _p("TIMEFRAME",                   os.environ.get("TIMEFRAME", "4h"))
+    TIMEFRAME                    = _p("TIMEFRAME",                   "5m")
     BB_LENGTH                    = 20
     BB_STD                       = 2.0
     PRE_ENTRY_GREEN_CANDLES      = 4
     PUMP_CONSECUTIVE_GREEN       = 4
     PUMP_WINDOW_CANDLES          = _p("PUMP_WINDOW_CANDLES",         6)
-    PUMP_CANDLE_BODY_MIN_PCT     = _p("PUMP_CANDLE_BODY_MIN_PCT",    5.0)
-    PUMP_MIN_GREEN_COUNT         = _p("PUMP_MIN_GREEN_COUNT",        4)
-    ENTRY_RED_BODY_MIN_PCT       = _p("ENTRY_RED_BODY_MIN_PCT",      4.0)
-    PRE_CANDLE_GREEN_BODY_MAX_PCT = _p("PRE_CANDLE_GREEN_BODY_MAX_PCT", 30.0)
+    PUMP_CANDLE_BODY_MIN_PCT     = _p("PUMP_CANDLE_BODY_MIN_PCT",    0.1)
+    PUMP_MIN_GREEN_COUNT         = _p("PUMP_MIN_GREEN_COUNT",        3)
+    ENTRY_RED_BODY_MIN_PCT       = _p("ENTRY_RED_BODY_MIN_PCT",      0.1)
+    PRE_CANDLE_GREEN_BODY_MAX_PCT = _p("PRE_CANDLE_GREEN_BODY_MAX_PCT", 5.0)
     GREEN_LOSS_MIN_BODY_PCT      = _p("GREEN_LOSS_MIN_BODY_PCT",     6.0)
-    GREEN_LOSS_SINGLE_BODY_PCT   = _p("GREEN_LOSS_SINGLE_BODY_PCT",  10.0)
-    ANTI_ROCKET_SINGLE_CANDLE_PCT = _p("ANTI_ROCKET_SINGLE_CANDLE_PCT", 30.0)
-    MIN_VOLUME_USDT              = _p("MIN_VOLUME_USDT",             10_000_000.0)
+    GREEN_LOSS_SINGLE_BODY_PCT   = _p("GREEN_LOSS_SINGLE_BODY_PCT",  3.0)
+    ANTI_ROCKET_SINGLE_CANDLE_PCT = _p("ANTI_ROCKET_SINGLE_CANDLE_PCT", 5.0)
+    MIN_VOLUME_USDT              = _p("MIN_VOLUME_USDT",             5_000_000.0)
 
     # ── Module 3 — TRADE MANAGEMENT ─────────────────────────────────
-    LEVERAGE                     = _p("LEVERAGE",                    int(os.environ.get("LEVERAGE", "3")))
-    MAX_ACTIVE_TRADES            = _p("MAX_ACTIVE_TRADES",           int(os.environ.get("MAX_ACTIVE_TRADES", "5")))
-    RISK_PER_TRADE_PCT           = _p("RISK_PER_TRADE_PCT",          2.0)
-    SL_ABOVE_ENTRY_PCT           = _p("SL_ABOVE_ENTRY_PCT",          15.0)
-    BREAKEVEN_DROP_PCT           = _p("BREAKEVEN_DROP_PCT",          7.0)
-    TSL_ACTIVATION_DROP_PCT      = _p("TSL_ACTIVATION_DROP_PCT",     7.0)
-    TSL_TRAIL_PCT                = _p("TSL_TRAIL_PCT",               4.0)
+    LEVERAGE                     = _p("LEVERAGE",                    3)
+    MAX_ACTIVE_TRADES            = _p("MAX_ACTIVE_TRADES",           5)
+    RISK_PER_TRADE_PCT           = _p("RISK_PER_TRADE_PCT",          0.5)
+    SL_ABOVE_ENTRY_PCT           = _p("SL_ABOVE_ENTRY_PCT",          2.5)
+    BREAKEVEN_DROP_PCT           = _p("BREAKEVEN_DROP_PCT",          1.5)
+    TSL_ACTIVATION_DROP_PCT      = _p("TSL_ACTIVATION_DROP_PCT",     5.0)
+    TSL_TRAIL_PCT                = _p("TSL_TRAIL_PCT",               2.0)
 
     # ── Module 4 — Çıkış yalnızca SL / BE / TSL ile ─────────────────
     # ── Module 5 — RE-ENTRY (Fresh Pump Koşulu) ─────────────────────
