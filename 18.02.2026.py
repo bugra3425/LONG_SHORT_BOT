@@ -1158,6 +1158,26 @@ class PumpSnifferBot:
         # ── KURAL 1: Async-safe iterasyon ──────────────────────────────
         for sym, trade in list(self.active_trades.items()):
             try:
+                # ── ÖNCE: Binance pozisyon kontrolü — manuel/TSL kapanış tespiti ──
+                positions = await self._safe_call(self.exchange.fetch_positions, [sym])
+                position_open = False
+                if positions:
+                    for pos in positions:
+                        if pos.get("symbol") == sym and abs(float(pos.get("contracts", 0))) > 0:
+                            position_open = True
+                            break
+                
+                if not position_open:
+                    # Pozisyon Binance'te yok ama active_trades'de var → temizle
+                    log.warning(f"  🧹 {sym}: Pozisyon Binance'te kapalı, active_trades'den kaldırılıyor...")
+                    await self._cancel_algo_orders(sym, retry=False)
+                    closed.append(sym)
+                    try:
+                        notifier.send(f"🧹 POZİSYON TEMİZLENDİ\n🪙 {sym}\nBinance'te pozisyon bulunamadı (TSL/Manuel kapatılmış)")
+                    except Exception:
+                        pass
+                    continue
+
                 # ── KURAL 2: OHLCV yerine TICKER — anlık mark/last price ──
                 ticker = await self._safe_call(self.exchange.fetch_ticker, sym)
                 if not ticker:
