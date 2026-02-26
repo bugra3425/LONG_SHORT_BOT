@@ -19,6 +19,7 @@ KULLANIM:
 
 # ── Standart Kütüphaneler ────────────────────────────────────────────────
 import asyncio
+import csv
 import logging
 import sys
 import time
@@ -252,6 +253,73 @@ class TradeRecord:
     pump_high: float = 0.0
     pump_low: float = 0.0
     leverage: int = 3              # Pozisyonda kullanılan kaldıraç (dinamik)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# TRADE KAYIT SİSTEMİ — Global Helper Fonksiyon
+# ──────────────────────────────────────────────────────────────────────────
+def save_trade_to_csv(trade: TradeRecord, mode: str = "LIVE"):
+    """
+    Kapatılan trade'i CSV dosyasına kaydet — Binance Demo trade history göstermediği için.
+    
+    Dosya adı: trade_log_YYYYMMDD.csv (Her gün yeni dosya)
+    Kolonlar: Tüm trade detayları + TSL/BE/GREEN-LOSS statusları
+    
+    Args:
+        trade: TradeRecord instance
+        mode: "LIVE" veya "BACKTEST" (dosya adına prefix ekler)
+    """
+    try:
+        today = datetime.now().strftime("%Y%m%d")
+        prefix = "BT_" if mode == "BACKTEST" else ""
+        filename = f"{prefix}trade_log_{today}.csv"
+        
+        # Dosya yoksa header yaz
+        file_exists = os.path.isfile(filename)
+        
+        with open(filename, "a", newline="", encoding="utf-8") as f:
+            fieldnames = [
+                "timestamp", "symbol", "side", "entry_time", "exit_time",
+                "entry_price", "exit_price", "stop_loss", "initial_sl",
+                "position_size_usdt", "leverage", "notional_usdt",
+                "pnl_usdt", "pnl_pct", "exit_reason",
+                "breakeven_triggered", "tsl_active", "lowest_low_reached",
+                "pump_pct", "pump_high", "consec_green_loss", "reentry_count"
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            
+            if not file_exists:
+                writer.writeheader()
+            
+            writer.writerow({
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "symbol": trade.symbol,
+                "side": trade.side,
+                "entry_time": trade.entry_time,
+                "exit_time": trade.exit_time,
+                "entry_price": f"{trade.entry_price:.8f}",
+                "exit_price": f"{trade.exit_price:.8f}",
+                "stop_loss": f"{trade.stop_loss:.8f}",
+                "initial_sl": f"{trade.initial_stop_loss:.8f}",
+                "position_size_usdt": f"{trade.position_size_usdt:.4f}",
+                "leverage": trade.leverage,
+                "notional_usdt": f"{trade.position_size_usdt * trade.leverage:.4f}",
+                "pnl_usdt": f"{trade.pnl_usdt:.2f}",
+                "pnl_pct": f"{trade.pnl_pct:.2f}",
+                "exit_reason": trade.exit_reason,
+                "breakeven_triggered": "YES" if trade.breakeven_triggered else "NO",
+                "tsl_active": "YES" if trade.tsl_active else "NO",
+                "lowest_low_reached": f"{trade.lowest_low_reached:.8f}" if trade.lowest_low_reached > 0 else "N/A",
+                "pump_pct": f"{trade.pump_pct:.2f}",
+                "pump_high": f"{trade.pump_high:.8f}",
+                "consec_green_loss": trade.consec_green_loss,
+                "reentry_count": trade.reentry_count,
+            })
+            
+        log.info(f"  💾 CSV KAYIT: {filename}  →  {trade.symbol}  {trade.exit_reason}  {trade.pnl_usdt:+.2f} USDT")
+    
+    except Exception as e:
+        log.error(f"  ❌ CSV kayıt hatası: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1281,6 +1349,7 @@ class PumpSnifferBot:
                     trade.pnl_pct     = round(pnl_pct * 100, 4)
                     trade.pnl_usdt    = round(pnl_usd, 2)
                     self.trade_history.append(trade)
+                    save_trade_to_csv(trade, "LIVE")  # CSV'ye kaydet
                     closed.append(sym)
                     self._post_exit_price[sym] = exit_p
                     self._new_push[sym] = False
@@ -1323,6 +1392,7 @@ class PumpSnifferBot:
                         trade.pnl_pct     = round(pnl_pct * 100, 4)
                         trade.pnl_usdt    = round(pnl_usd, 2)
                         self.trade_history.append(trade)
+                        save_trade_to_csv(trade, "LIVE")  # CSV'ye kaydet
                         closed.append(sym)
                         self._post_exit_price[sym] = exit_p
                         self._new_push[sym] = False
@@ -1349,6 +1419,7 @@ class PumpSnifferBot:
                         trade.pnl_pct     = round(pnl_pct * 100, 4)
                         trade.pnl_usdt    = round(pnl_usd, 2)
                         self.trade_history.append(trade)
+                        save_trade_to_csv(trade, "LIVE")  # CSV'ye kaydet
                         closed.append(sym)
                         self._post_exit_price[sym] = exit_p
                         self._new_push[sym] = False
@@ -1942,6 +2013,7 @@ class Backtester:
                         equity += pnl_usd
                         self.equity_curve.append(equity)
                         self.trades.append(trade)
+                        save_trade_to_csv(trade, "BACKTEST")  # CSV'ye kaydet
                         del active[sym]
                         last_exit_price = exit_p
                         new_push_seen = False
@@ -1968,6 +2040,7 @@ class Backtester:
                             equity += pnl_usd
                             self.equity_curve.append(equity)
                             self.trades.append(trade)
+                            save_trade_to_csv(trade, "BACKTEST")  # CSV'ye kaydet
                             del active[sym]
                             last_exit_price = exit_p
                             new_push_seen = False
@@ -1991,6 +2064,7 @@ class Backtester:
                             equity += pnl_usd
                             self.equity_curve.append(equity)
                             self.trades.append(trade)
+                            save_trade_to_csv(trade, "BACKTEST")  # CSV'ye kaydet
                             del active[sym]
                             last_exit_price = exit_p
                             new_push_seen = False
@@ -2121,6 +2195,7 @@ class Backtester:
                 equity += pnl_usd
                 self.equity_curve.append(equity)
                 self.trades.append(trade)
+                save_trade_to_csv(trade, "BACKTEST")  # CSV'ye kaydet
                 log.info(f"  [BT-END] 🔵 {sym}  PnL: {pnl_usd:+.2f}")
 
         self.equity_curve.append(equity)
@@ -2502,6 +2577,7 @@ class FullUniverseBacktester:
                     equity += pnl_usd
                     self.equity_curve.append(equity)
                     self.trades.append(trade)
+                    save_trade_to_csv(trade, "BACKTEST")  # CSV'ye kaydet
                     closed.append(sym)
                     consumed_signals.discard(sym)  # Çıkış sonrası yeniden girişe izin ver
                     post_exit_price[sym] = exit_p
@@ -2528,6 +2604,7 @@ class FullUniverseBacktester:
                         equity += pnl_usd
                         self.equity_curve.append(equity)
                         self.trades.append(trade)
+                        save_trade_to_csv(trade, "BACKTEST")  # CSV'ye kaydet
                         closed.append(sym)
                         consumed_signals.discard(sym)  # Çıkış sonrası yeniden girişe izin ver
                         post_exit_price[sym] = exit_p
@@ -2551,6 +2628,7 @@ class FullUniverseBacktester:
                         equity += pnl_usd
                         self.equity_curve.append(equity)
                         self.trades.append(trade)
+                        save_trade_to_csv(trade, "BACKTEST")  # CSV'ye kaydet
                         closed.append(sym)
                         consumed_signals.discard(sym)  # Çıkış sonrası yeniden girişe izin ver
                         post_exit_price[sym] = exit_p
@@ -2749,6 +2827,7 @@ class FullUniverseBacktester:
             equity           += pnl_usd
             self.equity_curve.append(equity)
             self.trades.append(trade)
+            save_trade_to_csv(trade, "BACKTEST")  # CSV'ye kaydet
             print(f"  [BT-END] 🔵 {sym:<16}  exit: {exit_p:.6f}  PnL: {pnl_usd:>+8.4f}$")
 
         self.equity_curve.append(equity)
