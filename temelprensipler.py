@@ -7,14 +7,12 @@ ROL: Algoritmik Ticaret Botu (Quant Strategy)
 AMAÇ: Pump yapan low/mid-cap altcoinlerde dağıtım (distribution) sinyali
       yakalamak ve SHORT pozisyon açmak.
 
-⚠️  DİKKAT: Bu dosya SADECE temel prensipler ve giriş mantığını içerir.
-    Risk yönetimi (SL/TSL/TP) ve pozisyon kapatma mantığı YOKTUR.
-
 MODÜLLER:
   1. Zaman Ayarlı Asenkron Motor (Timing Engine)
   2. Radar ve Av Tespiti (Universe & Watchlist)
   3. Keskin Nişancı Tetiği (Entry Trigger)
   4. Kasa Yönetimi (Position Sizing)
+  5. Risk Yönetimi (Stop Loss, Breakeven, TSL)
 
 ================================================================================
 """
@@ -23,6 +21,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
+from dataclasses import dataclass, field
 
 import pandas as pd
 import ccxt.async_support as ccxt
@@ -34,6 +33,35 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 log = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TRADE VERİ YAPISI
+# ══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Trade:
+    """
+    Aktif bir pozisyonun tüm bilgilerini tutan veri sınıfı.
+    """
+    symbol: str
+    entry_price: float
+    position_size_usdt: float
+    leverage: int
+    stop_loss: float
+    initial_stop_loss: float
+    
+    # Risk yönetimi bayrakları
+    breakeven_triggered: bool = False    # Breakeven devreye girdi mi?
+    tsl_active: bool = False            # TSL aktif mi?
+    lowest_low_reached: float = 0.0     # TSL için en düşük fiyat
+    
+    # Yeşil mum takibi
+    consec_green_loss: int = 0          # Ardışık yeşil mum sayacı
+    
+    def pnl_pct(self, current_price: float) -> float:
+        """SHORT pozisyon için PnL yüzdesi hesapla."""
+        return ((self.entry_price - current_price) / self.entry_price) * 100.0
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -66,6 +94,15 @@ class Config:
     # ── Modül 4: Kasa Yönetimi ────────────────────────────────────────────
     MARGIN_PCT = 20.0              # Bakiyenin %20'si kullanılır
     LEVERAGE = 3                   # Sabit 3x kaldıraç
+    
+    # ── Modül 5: Risk Yönetimi (Stop Loss Mantığı) ───────────────────────
+    SL_ABOVE_ENTRY_PCT = 15.0      # İlk SL: Giriş fiyatının %15 üstü
+    BREAKEVEN_DROP_PCT = 7.0       # %7 düşüşte SL → giriş fiyatına
+    TSL_ACTIVATION_DROP_PCT = 7.0  # %7 düşüşte TSL aktif
+    TSL_TRAIL_PCT = 4.0            # TSL: en düşükten %4 yukarı sekince kapat
+    GREEN_LOSS_MIN_BODY_PCT = 2.0  # 2 ardışık yeşil mum için min gövde (değiştirildi)
+    GREEN_LOSS_SINGLE_BODY_PCT = 10.0  # Tek yeşil mum için min gövde
+    MANAGER_INTERVAL_SEC = 5       # Manager loop çalışma aralığı (saniye)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -92,8 +129,9 @@ class PumpReversionBot:
             'options': {'defaultType': 'future'}  # USDT-M Vadeli İşlemler
         })
         
-        self.universe: List[str] = []      # Tüm USDT-M çiftleri (filtrelenmiş)
-        self.watchlist: Dict[str, float] = {}  # {symbol: pump_pct} — İzleme listesi
+        self.universe: List[str] = []           # Tüm USDT-M çiftleri (filtrelenmiş)
+        self.watchlist: Dict[str, float] = {}   # {symbol: pump_pct} — İzleme listesi
+        self.active_trades: Dict[str, Trade] = {}  # {symbol: Trade} — Açık pozisyonlar
         
         log.info("✅ Bot başlatıldı — Binance USDT-M Futures bağlantısı hazır")
     
@@ -210,9 +248,13 @@ class PumpReversionBot:
                 
                 log.info("🔥 [TRIGGER] 4H kapandı — watchlist kontrol ediliyor...")
                 
-                # MODÜL 3: Watchlist'teki coinleri kontrol et
+                # MODÜL 3: Watchlist'teki coinleri kontrol et (YENİ GİRİŞ)
                 for symbol in list(self.watchlist.keys()):
                     await self._check_entry_signal(symbol)
+                
+                # MODÜL 5: Açık pozisyonlarda yeşil mum kontrolü (ÇIKIŞ)
+                for symbol in list(self.active_trades.keys()):
+                    await self._check_green_candle_exit(symbol)
                 
                 # Sonraki 4H kapanışını bekle
                 remaining = self._seconds_until_next_4h_close()
@@ -464,16 +506,367 @@ class PumpReversionBot:
                 amount=qty
             )
             
+            # 7. İlk Stop Loss hesapla ve koy
+            initial_sl = entry_price * (1 + Config.SL_ABOVE_ENTRY_PCT / 100.0)
+            
+            try:
+                sl_order = await self.exchange.create_order(
+                    symbol=symbol,
+                    type='STOP_MARKET',
+                    side='buy',
+                    amount=qty,
+                    params={
+                        'stopPrice': initial_sl,
+                        'reduceOnly': True
+                    }
+                )
+                log.info(f"   🛡️  SL Kondu: {initial_sl:.6f} (+{Config.SL_ABOVE_ENTRY_PCT}%)")
+            except Exception as e:
+                log.warning(f"   ⚠️  SL koyma hatası: {e}")
+            
+            # 8. Trade objesini oluştur ve active_trades'e ekle
+            trade = Trade(
+                symbol=symbol,
+                entry_price=entry_price,
+                position_size_usdt=margin,
+                leverage=Config.LEVERAGE,
+                stop_loss=initial_sl,
+                initial_stop_loss=initial_sl
+            )
+            self.active_trades[symbol] = trade
+            
             log.info(
                 f"✅ SHORT AÇILDI: {symbol}\n"
                 f"   Emir ID     : {order.get('id')}\n"
                 f"   Miktar      : {qty}\n"
                 f"   Fiyat       : {entry_price:.6f}\n"
-                f"   Notional    : {notional:.2f} USDT"
+                f"   Notional    : {notional:.2f} USDT\n"
+                f"   İlk SL      : {initial_sl:.6f}\n"
+                f"   📊 Aktif Pozisyon: {len(self.active_trades)} adet"
             )
             
         except Exception as e:
             log.error(f"❌ Pozisyon açma hatası ({symbol}): {e}")
+    
+    
+    # ══════════════════════════════════════════════════════════════════════
+    #  MODÜL 5: RİSK YÖNETİMİ (Stop Loss Management)
+    # ══════════════════════════════════════════════════════════════════════
+    
+    async def _manage_positions_loop(self):
+        """
+        Manager Loop — Açık pozisyonları sürekli kontrol eder.
+        
+        4 Aşamalı Risk Yönetimi:
+          Stage 1: İlk SL     → Giriş + %15 (başlangıçta konulur)
+          Stage 2: Breakeven  → %7 düşüşte SL = giriş fiyatı
+          Stage 3: TSL Aktif  → %7 düşüşte trailing stop devreye girer
+          Stage 4: Yeşil Mum  → Zarardayken yeşil mum kontrolü
+        
+        Her 5 saniyede çalışır (MANAGER_INTERVAL_SEC).
+        """
+        log.info("🔄 [MANAGER LOOP] Başlatıldı — Pozisyon yönetimi aktif")
+        
+        while True:
+            try:
+                await asyncio.sleep(Config.MANAGER_INTERVAL_SEC)
+                
+                if not self.active_trades:
+                    continue  # Aktif pozisyon yoksa döngüye devam
+                
+                # Async-safe iterasyon (dict değişebilir)
+                for symbol, trade in list(self.active_trades.items()):
+                    try:
+                        # TICKER (real-time price) çek
+                        ticker = await self.exchange.fetch_ticker(symbol)
+                        current_price = ticker.get('mark') or ticker.get('last')
+                        if not current_price:
+                            continue
+                        current_price = float(current_price)
+                        
+                        # ═══════════════════════════════════════════════════
+                        #  STAGE 1: Breakeven Kontrolü
+                        # ═══════════════════════════════════════════════════
+                        if not trade.breakeven_triggered:
+                            drop_pct = ((trade.entry_price - current_price) / trade.entry_price) * 100.0
+                            
+                            if drop_pct >= Config.BREAKEVEN_DROP_PCT:
+                                # SL'yi giriş fiyatına çek
+                                trade.stop_loss = trade.entry_price
+                                trade.breakeven_triggered = True
+                                
+                                # Binance'te SL'yi güncelle (eski SL iptal, yeni SL koy)
+                                await self._update_stop_loss(symbol, trade.entry_price)
+                                
+                                log.info(
+                                    f"⚡ BREAKEVEN: {symbol}\n"
+                                    f"   Düşüş: {drop_pct:.2f}%\n"
+                                    f"   YENİ SL: {trade.entry_price:.6f} (giriş fiyatı)"
+                                )
+                        
+                        # ═══════════════════════════════════════════════════
+                        #  STAGE 2: TSL (Trailing Stop Loss) Kontrolü
+                        # ═══════════════════════════════════════════════════
+                        drop_pct = ((trade.entry_price - current_price) / trade.entry_price) * 100.0
+                        
+                        if not trade.tsl_active:
+                            # TSL aktivasyonu (%7 düşüş)
+                            if drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
+                                trade.tsl_active = True
+                                trade.lowest_low_reached = current_price
+                                new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
+                                trade.stop_loss = min(trade.stop_loss, new_sl)
+                                
+                                # TSL emri koy
+                                await self._place_trailing_stop(symbol, trade.stop_loss)
+                                
+                                log.info(
+                                    f"🎯 TSL AKTİF: {symbol}\n"
+                                    f"   Düşüş: {drop_pct:.2f}%\n"
+                                    f"   En Düşük: {trade.lowest_low_reached:.6f}\n"
+                                    f"   TSL SL: {trade.stop_loss:.6f}"
+                                )
+                        else:
+                            # TSL güncelleme (yeni düşükler)
+                            if current_price < trade.lowest_low_reached:
+                                trade.lowest_low_reached = current_price
+                                new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
+                                
+                                if new_sl < trade.stop_loss:
+                                    old_sl = trade.stop_loss
+                                    trade.stop_loss = new_sl
+                                    
+                                    log.info(
+                                        f"📉 TSL GÜNCELLEME: {symbol}\n"
+                                        f"   Yeni Düşük: {trade.lowest_low_reached:.6f}\n"
+                                        f"   Eski SL: {old_sl:.6f} → Yeni SL: {new_sl:.6f}"
+                                    )
+                        
+                        # ═══════════════════════════════════════════════════
+                        #  STAGE 3: Yeşil Mum Kontrolü (4H kapanışta)
+                        # ═══════════════════════════════════════════════════
+                        # Not: Bu kontrol sadece 4H kapanışından sonra yapılır
+                        # Burası sürekli çalışan ticker kontrolü, mum kontrolü
+                        # trigger_loop'ta yapılır
+                        
+                    except Exception as e:
+                        log.error(f"❌ Pozisyon yönetim hatası ({symbol}): {e}")
+                        continue
+                
+            except Exception as e:
+                log.error(f"❌ [MANAGER LOOP] Hata: {e}")
+                await asyncio.sleep(5)
+    
+    
+    async def _update_stop_loss(self, symbol: str, new_sl: float):
+        """
+        Binance'teki SL emrini günceller (eski SL iptal, yeni SL koy).
+        
+        Args:
+            symbol: Coin çifti
+            new_sl: Yeni SL fiyatı
+        """
+        try:
+            # Önce açık emirleri çek ve eski SL'leri iptal et
+            open_orders = await self.exchange.fetch_open_orders(symbol)
+            for order in open_orders:
+                if order.get('type') in ['STOP_MARKET', 'STOP']:
+                    await self.exchange.cancel_order(order['id'], symbol)
+                    log.info(f"   🗑️  Eski SL iptal edildi: {order['id']}")
+            
+            # Yeni SL koy
+            trade = self.active_trades.get(symbol)
+            if not trade:
+                return
+            
+            # Pozisyon miktarını al
+            positions = await self.exchange.fetch_positions([symbol])
+            qty = 0.0
+            for pos in positions:
+                if pos.get('symbol') == symbol:
+                    qty = abs(float(pos.get('contracts', 0)))
+                    break
+            
+            if qty > 0:
+                await self.exchange.create_order(
+                    symbol=symbol,
+                    type='STOP_MARKET',
+                    side='buy',
+                    amount=qty,
+                    params={
+                        'stopPrice': new_sl,
+                        'reduceOnly': True
+                    }
+                )
+                log.info(f"   ✅ Yeni SL kondu: {new_sl:.6f}")
+        
+        except Exception as e:
+            log.error(f"   ❌ SL güncelleme hatası: {e}")
+    
+    
+    async def _place_trailing_stop(self, symbol: str, activation_price: float):
+        """
+        Binance'e TRAILING_STOP_MARKET emri koyar.
+        
+        Args:
+            symbol: Coin çifti
+            activation_price: Aktivasyon fiyatı
+        """
+        try:
+            # Önce eski SL'leri temizle
+            await self._update_stop_loss(symbol, activation_price)
+            
+            # TSL emri koy
+            trade = self.active_trades.get(symbol)
+            if not trade:
+                return
+            
+            # Pozisyon miktarını al
+            positions = await self.exchange.fetch_positions([symbol])
+            qty = 0.0
+            for pos in positions:
+                if pos.get('symbol') == symbol:
+                    qty = abs(float(pos.get('contracts', 0)))
+                    break
+            
+            if qty > 0:
+                await self.exchange.create_order(
+                    symbol=symbol,
+                    type='TRAILING_STOP_MARKET',
+                    side='buy',
+                    amount=qty,
+                    params={
+                        'callbackRate': Config.TSL_TRAIL_PCT,  # %4
+                        'activationPrice': activation_price,
+                        'reduceOnly': True
+                    }
+                )
+                log.info(f"   🎯 TSL emri kondu (callback: %{Config.TSL_TRAIL_PCT})")
+        
+        except Exception as e:
+            log.error(f"   ❌ TSL koyma hatası: {e}")
+    
+    
+    async def _check_green_candle_exit(self, symbol: str):
+        """
+        Yeşil mum acil çıkış kontrolü (4H kapanıştan sonra çağrılır).
+        
+        2 Senaryo:
+          A) Tek güçlü yeşil: Gövde >= %10 → KAPAT
+          B) 2 ardışık yeşil: Her ikisi >= %2 → KAPAT (değiştirildi)
+        
+        Args:
+            symbol: Kontrol edilecek coin
+        """
+        try:
+            trade = self.active_trades.get(symbol)
+            if not trade:
+                return
+            
+            # Ticker ile PnL hesapla
+            ticker = await self.exchange.fetch_ticker(symbol)
+            current_price = ticker.get('mark') or ticker.get('last')
+            if not current_price:
+                return
+            
+            pnl_pct = trade.pnl_pct(float(current_price))
+            
+            # Sadece zarardayken kontrol et
+            if pnl_pct >= 0:
+                trade.consec_green_loss = 0
+                return
+            
+            # Son 2 mumu çek
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, Config.TIMEFRAME, limit=2)
+            if len(ohlcv) < 2:
+                return
+            
+            last_candle = ohlcv[-1]
+            last_open = last_candle[1]
+            last_close = last_candle[4]
+            
+            # ═══════════════════════════════════════════════════════════════
+            #  SENARYO A: Tek güçlü yeşil mum (>= %10)
+            # ═══════════════════════════════════════════════════════════════
+            if last_close > last_open:
+                body_pct = ((last_close - last_open) / last_open) * 100.0
+                
+                if body_pct >= Config.GREEN_LOSS_SINGLE_BODY_PCT:
+                    log.warning(
+                        f"🚨 TEK GÜÇLÜ YEŞİL MUM: {symbol}\n"
+                        f"   Gövde: +{body_pct:.2f}% (>= {Config.GREEN_LOSS_SINGLE_BODY_PCT}%)\n"
+                        f"   PnL: {pnl_pct:.2f}% (ZARAR)\n"
+                        f"   → ANINDA KAPAT!"
+                    )
+                    await self._close_position(symbol, "GREEN-SINGLE")
+                    return
+            
+            # ═══════════════════════════════════════════════════════════════
+            #  SENARYO B: 2 ardışık yeşil mum (her ikisi >= %2) - DEĞİŞTİRİLDİ
+            # ═══════════════════════════════════════════════════════════════
+            if last_close > last_open:
+                body_pct = ((last_close - last_open) / last_open) * 100.0
+                
+                if body_pct >= Config.GREEN_LOSS_MIN_BODY_PCT:
+                    trade.consec_green_loss += 1
+                    log.info(f"   🟢 Yeşil mum: {symbol}  Gövde: +{body_pct:.2f}%  Sayaç: {trade.consec_green_loss}")
+                    
+                    if trade.consec_green_loss >= 2:
+                        log.warning(
+                            f"🚨 2 ARDINDAN YEŞİL MUM: {symbol}\n"
+                            f"   Gövde: >= {Config.GREEN_LOSS_MIN_BODY_PCT}% (her ikisi)\n"
+                            f"   PnL: {pnl_pct:.2f}% (ZARAR)\n"
+                            f"   → ANINDA KAPAT!"
+                        )
+                        await self._close_position(symbol, "2xGREEN-LOSS")
+                else:
+                    trade.consec_green_loss = 0  # Eşik altı → sayacı sıfırla
+            else:
+                trade.consec_green_loss = 0  # Kırmızı mum → sayacı sıfırla
+        
+        except Exception as e:
+            log.error(f"❌ Yeşil mum kontrolü hatası ({symbol}): {e}")
+    
+    
+    async def _close_position(self, symbol: str, reason: str):
+        """
+        Pozisyonu market fiyatından kapatır.
+        
+        Args:
+            symbol: Kapatılacak coin
+            reason: Kapatma nedeni (log için)
+        """
+        try:
+            # Önce tüm SL/TSL emirlerini iptal et
+            open_orders = await self.exchange.fetch_open_orders(symbol)
+            for order in open_orders:
+                await self.exchange.cancel_order(order['id'], symbol)
+            
+            # Pozisyon miktarını al
+            positions = await self.exchange.fetch_positions([symbol])
+            qty = 0.0
+            for pos in positions:
+                if pos.get('symbol') == symbol:
+                    qty = abs(float(pos.get('contracts', 0)))
+                    break
+            
+            if qty > 0:
+                # Market close (reduce only)
+                await self.exchange.create_order(
+                    symbol=symbol,
+                    type='market',
+                    side='buy',
+                    amount=qty,
+                    params={'reduceOnly': True}
+                )
+                log.info(f"✅ POZİSYON KAPANDI: {symbol}  Neden: {reason}")
+            
+            # Active trades'den sil
+            if symbol in self.active_trades:
+                del self.active_trades[symbol]
+        
+        except Exception as e:
+            log.error(f"❌ Pozisyon kapatma hatası ({symbol}): {e}")
     
     
     # ══════════════════════════════════════════════════════════════════════
@@ -482,17 +875,19 @@ class PumpReversionBot:
     
     async def run(self):
         """
-        Bot'un ana çalıştırıcısı — iki asenkron döngüyü paralel başlatır.
+        Bot'un ana çalıştırıcısı — üç asenkron döngüyü paralel başlatır.
         
         Döngüler:
-          1. PREP Loop  : 4H kapanışına 10 dakika kala tarama yapar
+          1. PREP Loop   : 4H kapanışına 10 dakika kala tarama yapar
           2. TRIGGER Loop: 4H kapanışından 2 saniye sonra sinyal kontrol eder
+          3. MANAGER Loop: Her 5 saniyede pozisyon yönetimi yapar (SL/BE/TSL)
         """
         log.info("🚀 Bot başlatılıyor — Asenkron döngüler çalışacak...")
         
         await asyncio.gather(
             self._prep_scan_loop(),
-            self._trigger_loop()
+            self._trigger_loop(),
+            self._manage_positions_loop()  # Risk yönetimi eklendi
         )
     
     
@@ -523,11 +918,35 @@ if __name__ == "__main__":
     Kullanım:
       python temelprensipler.py
     
-    Çalışma Prensibi:
-      1. Bot başlar ve 4H kapanış zamanlamasına senkronize olur
-      2. Her 4H kapanışına 10 dakika kala pump taraması yapar (watchlist)
-      3. 4H kapanışından 2 saniye sonra watchlist'teki coinlerde kırmızı mum arar
-      4. Koşul sağlanırsa bakiyenin %20'si ile 3x kaldıraçlı SHORT açar
-      5. SADECE GİRİŞ YAPAR — Risk yönetimi (SL/TSL/TP) YOK
+    Çalışma Prensibi (4 Saatlik Timeframe):
+      
+      1. BAŞLANGIÇ - Zaman Senkronizasyonu
+         → Bot başlar ve 4H kapanış zamanlamasına senkronize olur
+      
+      2. TARAMA - Pump Tespiti
+         → Her 4H kapanışına 10 dakika kala pump taraması yapar
+         → Top 10 coin watchlist'e eklenir
+      
+      3. GİRİŞ - SHORT Pozisyon Açma
+         → 4H kapanışından 2 saniye sonra kırmızı mum kontrolü
+         → Koşul sağlanırsa bakiyenin %20'si ile 3x SHORT açar
+         → İlk SL konur: Giriş + %15
+      
+      4. RİSK YÖNETİMİ - Dinamik Stop Loss (Her 5 saniyede)
+         
+         Stage 1: BREAKEVEN
+           → Fiyat %7 düştüğünde SL = giriş fiyatı
+         
+         Stage 2: TSL (Trailing Stop)
+           → Fiyat %7 düştüğünde TSL aktif
+           → En düşük fiyattan %4 yukarı sekince kapat
+         
+         Stage 3: YEŞİL MUM ÇIKIŞI (Zarardayken)
+           → Tek %10+ yeşil mum → ANINDA KAPAT
+           → 2 ardışık %2+ yeşil mum → ANINDA KAPAT (değiştirildi)
+      
+      5. PARALEL ÇALIŞMA
+         → 3 asenkron döngü aynı anda çalışır
+         → PREP: Tarama, TRIGGER: Giriş/Çıkış, MANAGER: Risk Yönetimi
     """
     asyncio.run(main())
