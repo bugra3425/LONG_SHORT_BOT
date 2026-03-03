@@ -1,43 +1,42 @@
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║          PUMP & DUMP REVERSION BOT — HIZLI TEST PARAMETRELERİ        ║
-# ║  DİKKAT: Bu ayarlar SADECE risk motorunu (BE, TSL, SL) test etmek    ║
-# ║  içindir. Gerçek trade için kullanmayınız!                           ║
+# ║              ORİJİNAL DEĞERLER — 4H PROFİL                          ║
+# ║  orjinal değerler.py dosyasından yüklendi.                          ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 
 # ──────────────────────────────────────────────────────────────────────
-#  BÖLÜM 1 — ZAMAN DİLİMİ (Hiper-Aktif Mod)
+#  BÖLÜM 1 — ZAMAN DİLİMİ
 # ──────────────────────────────────────────────────────────────────────
 
-TIMEFRAME = "5m"
+TIMEFRAME = "4h"
 
 # ──────────────────────────────────────────────────────────────────────
-#  BÖLÜM 2 — PUMP TESPİT KOŞULLARI (Mikro Pump)
+#  BÖLÜM 2 — PUMP TESPİT KOŞULLARI
 # ──────────────────────────────────────────────────────────────────────
 
-PUMP_MIN_PCT = 3
+PUMP_MIN_PCT = 30.0
 PUMP_WINDOW_CANDLES = 6
-PUMP_MIN_GREEN_COUNT = 3
-PUMP_CANDLE_BODY_MIN_PCT = 0.1
-TOP_N_GAINERS = 15
-MIN_VOLUME_USDT = 5_000_000.0
+PUMP_MIN_GREEN_COUNT = 4
+PUMP_CANDLE_BODY_MIN_PCT = 5.0
+TOP_N_GAINERS = 20
+MIN_VOLUME_USDT = 10_000_000.0
 
 # ──────────────────────────────────────────────────────────────────────
-#  BÖLÜM 3 — GİRİŞ TETİKLEYİCİ KOŞULLARI (Anında Giriş)
+#  BÖLÜM 3 — GİRİŞ TETİKLEYİCİ KOŞULLARI
 # ──────────────────────────────────────────────────────────────────────
 
-ENTRY_RED_BODY_MIN_PCT = 0.1
-PRE_CANDLE_GREEN_BODY_MAX_PCT = 5.0
-ANTI_ROCKET_SINGLE_CANDLE_PCT = 5.0
-GREEN_LOSS_SINGLE_BODY_PCT = 3.0
+ENTRY_RED_BODY_MIN_PCT = 4.0
+PRE_CANDLE_GREEN_BODY_MAX_PCT = 30.0
+ANTI_ROCKET_SINGLE_CANDLE_PCT = 22.0
+GREEN_LOSS_SINGLE_BODY_PCT = 10.0
 
 # ──────────────────────────────────────────────────────────────────────
-#  BÖLÜM 4 — STOP-LOSS VE TRAILING STOP (5m Test Profili)
+#  BÖLÜM 4 — STOP-LOSS VE TRAILING STOP (4H PROFİL)
 # ──────────────────────────────────────────────────────────────────────
 
-SL_ABOVE_ENTRY_PCT      = 2.5   # Giriş üstü ilk SL
-BREAKEVEN_DROP_PCT      = 1.5   # %1.5 kâra geçince SL → Entry
-TSL_ACTIVATION_DROP_PCT = 10.0  # Giriş fiyatının %10 altına fiyat gelince TSL aktif
-TSL_TRAIL_PCT           = 5.0   # En düşük fiyattan %5 yukarı sekince pozisyonu kapat
+SL_ABOVE_ENTRY_PCT      = 15.0  # 4H mumlarda geniş ilk SL
+BREAKEVEN_DROP_PCT      = 5.0   # %5 kâra geçince SL → Entry
+TSL_ACTIVATION_DROP_PCT = 8.0   # %8 kârda trailing stop devreye girsin
+TSL_TRAIL_PCT           = 4.0   # En düşük fiyattan %4 yukarı sekince kârı al
 
 # ──────────────────────────────────────────────────────────────────────
 #  BÖLÜM 5 — RİSK YÖNETİMİ
@@ -45,12 +44,23 @@ TSL_TRAIL_PCT           = 5.0   # En düşük fiyattan %5 yukarı sekince pozisy
 
 LEVERAGE = 3
 MAX_ACTIVE_TRADES = 5
-RISK_PER_TRADE_PCT = 0.5
+RISK_PER_TRADE_PCT = 2.0
 
 # ──────────────────────────────────────────────────────────────────────
-#  BÖLÜM 6 — TARAMA ARALIKLARI (Saniye Bazlı Hız)
+#  BÖLÜM 6 — TARAMA ARALIKLARI
 # ──────────────────────────────────────────────────────────────────────
 
-SCAN_INTERVAL_SEC = 60
-WATCHLIST_CHECK_INTERVAL_SEC = 15
+# SCAN_INTERVAL_SEC kaldırıldı — prep_scan_loop yönetiyor
+WATCHLIST_CHECK_INTERVAL_SEC = 60
 MANAGER_INTERVAL_SEC = 5
+
+# ──────────────────────────────────────────────────────────────────────
+#  BÖLÜM 7 — BACKTEST
+# ──────────────────────────────────────────────────────────────────────
+
+BACKTEST_DAYS = 31
+BACKTEST_INITIAL_CAPITAL = 1000.0
+BACKTEST_SYMBOLS = [
+    "TRB/USDT", "GAS/USDT", "CYBER/USDT", "LOOM/USDT",
+    "YGG/USDT", "VANRY/USDT", "ORDI/USDT", "BIGTIME/USDT",
+]

@@ -72,16 +72,22 @@ log = logging.getLogger("PumpDumpBot")
 def _load_params():
     import importlib.util
     _here = os.path.dirname(os.path.abspath(__file__))
-    # Önce aynı klasörde, sonra bir üst klasörde (root) ara
-    for _candidate in [os.path.join(_here, "params.py"),
-                       os.path.join(_here, "..", "params.py")]:
+    # Arama sırası: ayarlar.py önce (Türkçe açıklamalı), sonra params.py
+    candidates = [
+        ("ayarlar", os.path.join(_here, "ayarlar.py")),
+        ("ayarlar", os.path.join(_here, "..", "ayarlar.py")),
+        ("params",  os.path.join(_here, "params.py")),
+        ("params",  os.path.join(_here, "..", "params.py")),
+    ]
+    for _mod_name, _candidate in candidates:
         _path = os.path.normpath(_candidate)
         if os.path.exists(_path):
-            spec = importlib.util.spec_from_file_location("params", _path)
+            spec = importlib.util.spec_from_file_location(_mod_name, _path)
             mod  = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
+            log.info(f"⚙️  Ayarlar yüklendi: {_path}")
             return mod
-    log.warning("⚠️  params.py bulunamadı — Config varsayılan değerleri kullanılıyor")
+    log.warning("⚠️  ayarlar.py / params.py bulunamadı — Config varsayılan değerleri kullanılıyor")
     return None
 
 _P = _load_params()
@@ -252,6 +258,8 @@ class TradeRecord:
     pump_high: float = 0.0
     pump_low: float = 0.0
     leverage: int = 3              # Pozisyonda kullanılan kaldıraç (dinamik)
+    portfolio_after: float = 0.0   # İşlem kapandıktan sonraki toplam kasa
+    pnl_4h_est: float = 0.0        # 4H tahmini PnL (5m sim karşılaştırması için)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -285,7 +293,7 @@ class Config:
     }
     PUMP_MIN_PCT                 = _p("PUMP_MIN_PCT",                30.0)
     TOP_N_GAINERS                = _p("TOP_N_GAINERS",               10)
-    SCAN_INTERVAL_SEC            = _p("SCAN_INTERVAL_SEC",           int(os.environ.get("SCAN_INTERVAL_SECONDS", "600")))
+    # SCAN_INTERVAL_SEC kaldırıldı — _prep_scan_loop mum kapanışından 5dk önce tara yapıyor
     MANAGER_INTERVAL_SEC         = _p("MANAGER_INTERVAL_SEC",        5)
     WATCHLIST_CHECK_INTERVAL_SEC = _p("WATCHLIST_CHECK_INTERVAL_SEC", int(os.environ.get("WATCHLIST_CHECK_SECONDS", "60")))
 
@@ -295,23 +303,27 @@ class Config:
     BB_STD                       = 2.0
     PRE_ENTRY_GREEN_CANDLES      = 4
     PUMP_CONSECUTIVE_GREEN       = 4
-    PUMP_WINDOW_CANDLES          = _p("PUMP_WINDOW_CANDLES",         6)
-    PUMP_CANDLE_BODY_MIN_PCT     = _p("PUMP_CANDLE_BODY_MIN_PCT",    5.0)
+    PUMP_WINDOW_CANDLES          = _p("PUMP_WINDOW_CANDLES",         7)
     PUMP_MIN_GREEN_COUNT         = _p("PUMP_MIN_GREEN_COUNT",        4)
     ENTRY_RED_BODY_MIN_PCT       = _p("ENTRY_RED_BODY_MIN_PCT",      4.0)
+    # ENTRY_RED_BODY_MAX_PCT kaldırıldı — büyük kırmızı mum daha güçlü reversal sinyalidir
     PRE_CANDLE_GREEN_BODY_MAX_PCT = _p("PRE_CANDLE_GREEN_BODY_MAX_PCT", 30.0)
     GREEN_LOSS_MIN_BODY_PCT      = _p("GREEN_LOSS_MIN_BODY_PCT",     6.0)
     GREEN_LOSS_SINGLE_BODY_PCT   = _p("GREEN_LOSS_SINGLE_BODY_PCT",  10.0)
-    ANTI_ROCKET_SINGLE_CANDLE_PCT = _p("ANTI_ROCKET_SINGLE_CANDLE_PCT", 30.0)
+    ANTI_ROCKET_SINGLE_CANDLE_PCT = _p("ANTI_ROCKET_SINGLE_CANDLE_PCT", 22.0)
     MIN_VOLUME_USDT              = _p("MIN_VOLUME_USDT",             10_000_000.0)
 
     # ── Module 3 — TRADE MANAGEMENT ─────────────────────────────────
     LEVERAGE                     = _p("LEVERAGE",                    int(os.environ.get("LEVERAGE", "3")))
     MAX_ACTIVE_TRADES            = _p("MAX_ACTIVE_TRADES",           int(os.environ.get("MAX_ACTIVE_TRADES", "5")))
-    RISK_PER_TRADE_PCT           = _p("RISK_PER_TRADE_PCT",          2.0)
+    # RISK_PER_TRADE_PCT kaldırıldı — gerçek risk otomatik hesaplanır
+    @classmethod
+    def risk_per_trade_pct(cls) -> float:
+        """Gerçek max kayip % (kasa bazı): (1/MAX_ACTIVE_TRADES) x LEVERAGE x SL_ABOVE_ENTRY_PCT"""
+        return round((1.0 / cls.MAX_ACTIVE_TRADES) * cls.LEVERAGE * cls.SL_ABOVE_ENTRY_PCT, 2)
     SL_ABOVE_ENTRY_PCT           = _p("SL_ABOVE_ENTRY_PCT",          15.0)
-    BREAKEVEN_DROP_PCT           = _p("BREAKEVEN_DROP_PCT",          7.0)
-    TSL_ACTIVATION_DROP_PCT      = _p("TSL_ACTIVATION_DROP_PCT",     7.0)
+    BREAKEVEN_DROP_PCT           = _p("BREAKEVEN_DROP_PCT",          5.0)
+    TSL_ACTIVATION_DROP_PCT      = _p("TSL_ACTIVATION_DROP_PCT",     8.0)
     TSL_TRAIL_PCT                = _p("TSL_TRAIL_PCT",               4.0)
 
     # ── Module 4 — Çıkış yalnızca SL / BE / TSL ile ─────────────────
@@ -535,13 +547,16 @@ class PumpSnifferBot:
         if green_count < Config.PUMP_MIN_GREEN_COUNT:  # 4
             return None
 
-        # Koşul 2: 1. mumun dibi → 6. mumun kapanışı net kazanımı >= %30
-        # pump_high: SL/Mod-2 referansı için penceredeki mutlak zirve
-        # pump_start_low: pump başlangıcı (1. mumun low'u) — hem hesap hem WatchlistItem'a
+        # Koşul 2: 1. mumun gövde tabanı → giriş mumunun kapanışı >= PUMP_MIN_PCT
+        # pump_start_ref : 1. mum kırmızıysa close, yeşilse open  (wick dahil etme)
+        # entry_close    : giriş kırmızı mumunun kapanışı — pump hala ayakta mı diye kontrol
         pump_high      = max(c["high"] for c in window)
-        pump_start_low = window[0]["low"]
-        current_close  = window[-1]["close"]
-        net_gain_pct   = (current_close - pump_start_low) / pump_start_low * 100.0
+        pump_start_ref = min(window[0]["open"], window[0]["close"])  # Gövde tabanı
+        pump_start_low = window[0]["low"]   # WatchlistItem/rapor için saklanır
+        entry_close    = df_4h.iloc[-1]["close"]   # giriş mumu kapanışı
+        if pump_start_ref <= 0:
+            return None
+        net_gain_pct   = (entry_close - pump_start_ref) / pump_start_ref * 100.0
         if net_gain_pct < Config.PUMP_MIN_PCT:
             return None
 
@@ -666,7 +681,6 @@ class PumpSnifferBot:
         if red_body_pct < Config.ENTRY_RED_BODY_MIN_PCT:
             result["reasons"].append(f"ZAYIF KIRMIZI (gövde %{red_body_pct:.1f} < %{Config.ENTRY_RED_BODY_MIN_PCT}) — doji, giriş yok")
             return result
-
         # KOŞUL 2: Pump zirvesinin altına düşmüş olmalı (peak teyidi)
         if curr["close"] >= pump_high:
             result["reasons"].append("PUMP ZİRVESİ GEÇİLMEDİ — fiyat hâlâ zirve üstünde")
@@ -1371,7 +1385,7 @@ class PumpSnifferBot:
         if tf_min <= 30:  return 3 * 60
         if tf_min <= 60:  return 5 * 60
         if tf_min <= 120: return 8 * 60
-        return 10 * 60  # 4h+
+        return _p("PREP_SCAN_OFFSET_MIN", 5) * 60  # 4h+ — varsayılan 5dk
 
     @staticmethod
     def _seconds_until_next_close() -> float:
@@ -1539,8 +1553,13 @@ class PumpSnifferBot:
                 except Exception:
                     equity = 10_000
 
-                # Watchlist'teki her coini kontrol et
-                for sym, item in list(self.watchlist.items()):
+                # Watchlist'teki her coini kontrol et — en yüksek pump % önce (büyükten küçüğe)
+                sorted_watchlist = sorted(
+                    self.watchlist.items(),
+                    key=lambda x: x[1].pump_pct,
+                    reverse=True
+                )
+                for sym, item in sorted_watchlist:
                     if sym in self.active_trades:
                         continue
                     if len(self.active_trades) >= Config.MAX_ACTIVE_TRADES:
@@ -1650,7 +1669,7 @@ class PumpSnifferBot:
         log.info(f"  PUMP & DUMP REVERSION BOT v3.9.4 — ZAMAN AYARLI {tf} MİMARİSİ")
         log.info(f"  Kaldıraç: x{Config.LEVERAGE}  |  "
                  f"Top {Config.TOP_N_GAINERS} Gainer  |  "
-                 f"Risk/trade: %{Config.RISK_PER_TRADE_PCT}")
+                 f"Risk/trade: %{Config.risk_per_trade_pct()}")
         log.info(f"  ⏰ Sonraki {tf} kapanış: {next_close.strftime('%H:%M')} UTC  |  "
                  f"Prep: {prep_time.strftime('%H:%M')} UTC")
         log.info(f"  📡 PREP: kapanışa -{prep_offset//60}dk  |  "
@@ -1691,6 +1710,7 @@ class Backtester:
         self.capital   = initial_capital or Config.BACKTEST_INITIAL_CAPITAL
         self.exchange  = None   # async init'te set edilecek
         self.all_data: Dict[str, pd.DataFrame] = {}
+        self.all_data_5m: Dict[str, pd.DataFrame] = {}  # sym → 5m DataFrame (intra-bar sim için)
         self.trades: List[TradeRecord] = []
         self.equity_curve: List[float] = []
 
@@ -1750,12 +1770,55 @@ class Backtester:
         df.drop_duplicates(subset="timestamp", inplace=True)
         df.sort_values("timestamp", inplace=True)
         df.set_index("timestamp", inplace=True)
+        # end_dt sonrası barlari kes
+        df = df[df.index <= pd.Timestamp(self.end_dt)]
         return df
+
+    async def _fetch_historical_5m(self, symbol: str) -> pd.DataFrame:
+        """
+        5m granüler veri çek — simulate_intra_bar_exit için.
+        Her 4H bar içindeki 48 adet 5m mumu SL/TSL tetikleme hassasiyetiyle tarar.
+        """
+        fetch_start = self.start_dt - timedelta(hours=Config.PUMP_WINDOW_CANDLES * 4)
+        since_ms    = int(fetch_start.timestamp() * 1000)
+        until_ms    = int(self.end_dt.timestamp() * 1000)
+        all_candles: list = []
+        since_cur   = since_ms
+
+        while True:
+            try:
+                candles = await self.exchange.fetch_ohlcv(
+                    symbol, '5m', since=since_cur, limit=1000
+                )
+            except Exception as e:
+                log.warning(f"  {symbol} 5m veri hatası: {e}")
+                break
+            if not candles:
+                break
+            all_candles.extend(candles)
+            last_ts = candles[-1][0]
+            if last_ts >= until_ms or len(candles) < 1000:
+                break
+            since_cur = last_ts + 1
+            await asyncio.sleep(0.2)
+
+        if not all_candles:
+            return pd.DataFrame()
+
+        df5 = pd.DataFrame(all_candles,
+                           columns=["timestamp","open","high","low","close","volume"])
+        df5["timestamp"] = pd.to_datetime(df5["timestamp"], unit="ms", utc=True)
+        df5.drop_duplicates(subset="timestamp", inplace=True)
+        df5.sort_values("timestamp", inplace=True)
+        df5.set_index("timestamp", inplace=True)
+        df5 = df5[df5.index <= pd.Timestamp(self.end_dt)]
+        return df5
 
     async def load_data(self):
         """Tüm backtest sembollerinin verisini çek."""
         await self._init_exchange()
-        log.info(f"📥 {len(self.symbols)} sembol için {self.days} günlük 4H veri çekiliyor…")
+        _period = f"{self.days} günlük" if hasattr(self, 'days') else f"{self.start_dt.strftime('%d.%m.%Y')} → {self.end_dt.strftime('%d.%m.%Y')}"
+        log.info(f"📥 {len(self.symbols)} sembol için {_period} 4H veri çekiliyor…")
 
         for sym in self.symbols:
             df = await self._fetch_historical(sym)
@@ -1765,13 +1828,85 @@ class Backtester:
             self.all_data[sym] = df
             log.info(f"  ✔ {sym}: {len(df)} mum yüklendi  "
                      f"({df.index[0].strftime('%d.%m.%Y')} → {df.index[-1].strftime('%d.%m.%Y')})")
-            await asyncio.sleep(0.2)
+            # 5m granüler veri (intra-bar SL/TSL simülasyonu için)
+            df5 = await self._fetch_historical_5m(sym)
+            if not df5.empty:
+                self.all_data_5m[sym] = df5
+                log.info(f"  ✔ {sym} [5m]: {len(df5)} mum yüklendi")
+            await asyncio.sleep(0.3)
 
         await self.exchange.close()
-        log.info(f"📦 Toplam {len(self.all_data)} sembol yüklendi.\n")
+        log.info(f"📦 Toplam {len(self.all_data)} sembol yüklendi ({len(self.all_data_5m)} adet 5m verisi mevcut).\n")
 
     # ─────────────────────────────────────────────────────────────────
-    # 3.2  PUMP TESPİTİ (statik — geçmiş 4H veriden günlük kazanç)
+    # 3.2  5m İNTRA-BAR ÇİKIŞ SİMÜLASYONU
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def simulate_intra_bar_exit(
+        bar_4h_ts: "pd.Timestamp",
+        trade: "TradeRecord",
+        df_5m: "pd.DataFrame",
+        be_drop_pct: float,
+    ) -> "Optional[dict]":
+        """
+        Look-ahead bias olmadan 4H bar içindeki 48 adet 5m mumu sırasıyla kontrol eder.
+
+        Teknik gereksinimler:
+          • Execution Priority — 5m bar içinde HIGH >= SL → önce STOP (muhafazakar mod).
+          • Wick Sensitivity   — SL/TSL tetikleyicisi olarak 5m HIGH ve LOW kullanılır.
+          • TSL/BE state trade nesnesine doğrudan yazılır (intra-bar granüler güncelleme).
+
+        Döndürür:
+          {"exit_time", "exit_price", "exit_reason"}  — çıkış tetiklendiyse
+          None                                         — bu 4H bar içinde çıkış yok
+        """
+        if df_5m is None or df_5m.empty:
+            return None
+
+        bar_end = bar_4h_ts + pd.Timedelta(hours=4)
+        mask    = (df_5m.index >= bar_4h_ts) & (df_5m.index < bar_end)
+        sub     = df_5m.loc[mask]
+        if sub.empty:
+            return None
+
+        for ts5, b5 in sub.iterrows():
+            # ── Break-even (close bazlı, hassas) ─────────────────────
+            if not trade.breakeven_triggered:
+                drop_pct = (trade.entry_price - b5["close"]) / trade.entry_price * 100.0
+                if drop_pct >= be_drop_pct:
+                    trade.stop_loss         = trade.entry_price
+                    trade.breakeven_triggered = True
+                    trade.sl_moved_to_be    = True
+
+            # ── TSL aktivasyon / güncelleme (low bazlı) ──────────────
+            low_drop = (trade.entry_price - b5["low"]) / trade.entry_price * 100.0
+            if not trade.tsl_active:
+                if low_drop >= Config.TSL_ACTIVATION_DROP_PCT:
+                    trade.tsl_active           = True
+                    trade.lowest_low_reached   = b5["low"]
+                    new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
+                    trade.stop_loss = min(trade.stop_loss, new_sl)
+            else:
+                if b5["low"] < trade.lowest_low_reached:
+                    trade.lowest_low_reached = b5["low"]
+                    new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
+                    trade.stop_loss = min(trade.stop_loss, new_sl)
+
+            # ── Conservative: HIGH >= SL → derhal çıkış ──────────────
+            # (TP ve SL aynı 5m bar'da çakışırsa SL önce kabul edilir)
+            if b5["high"] >= trade.stop_loss:
+                reason = "TSL-HIT" if trade.tsl_active else "STOP-LOSS"
+                return {
+                    "exit_time":   ts5.strftime("%d.%m.%Y %H:%M"),
+                    "exit_price":  trade.stop_loss,
+                    "exit_reason": reason,
+                }
+
+        return None  # Bu 4H bar içinde çıkış tetiklenmedi
+
+    # ─────────────────────────────────────────────────────────────────
+    # 3.3  PUMP TESPİTİ (statik — geçmiş 4H veriden günlük kazanç)
     # ─────────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -1790,15 +1925,15 @@ class Backtester:
     def detect_pump_at_bar(df: pd.DataFrame, bar_idx: int,
                            daily_df: pd.DataFrame = None) -> Optional[dict]:
         """
-        Module 1 (Backtest): Son 6 adet 4H mumda (24 saatlik rolling pencere)
-        net yükseliş >= %30 ve yüksek, düşükten SONRA gerçekleşmiş mi?
+        Module 1 (Backtest): Son 7 adet 4H mumda (28 saatlik rolling pencere)
+        net yükseliş >= %30 ve en az 4 yeşil mum koşulu aranır.
 
-        rolling_low  = 6 mumun en düşük LOW'ı
-        rolling_high = 6 mumun en yüksek HIGH'ı
+        rolling_low  = 7 mumun en düşük LOW'ı
+        rolling_high = 7 mumun en yüksek HIGH'ı
         net_gain = (rolling_high - rolling_low) / rolling_low
         daily_df parametresi kullanılmıyor (geriye dönük uyumluluk).
         """
-        n = Config.PUMP_WINDOW_CANDLES  # 6
+        n = Config.PUMP_WINDOW_CANDLES  # 7
         if bar_idx < n:
             return None
 
@@ -1812,11 +1947,16 @@ class Backtester:
         if green_count < Config.PUMP_MIN_GREEN_COUNT:  # 4
             return None
 
-        # Koşul 2: 1. mumun dibi → 6. mumun kapanışı net kazanımı >= %30
+        # Koşul 2: 1. mumun gövde tabanı → giriş mumunun kapanışı >= PUMP_MIN_PCT
+        # pump_start_ref : 1. mum kırmızıysa close, yeşilse open  (wick dahil etme)
+        # entry_close    : giriş kırmızı mumunun kapanışı — pump hala ayakta mı diye kontrol
         pump_high      = max(c["high"] for c in window)
-        pump_start_low = window[0]["low"]
-        current_close  = window[-1]["close"]
-        net_gain_pct   = (current_close - pump_start_low) / pump_start_low * 100.0
+        pump_start_ref = min(window[0]["open"], window[0]["close"])  # Gövde tabanı
+        pump_start_low = window[0]["low"]   # Rapor/SL referansı için saklanır
+        entry_close    = df.iloc[bar_idx]["close"]   # giriş mumu kapanışı
+        if pump_start_ref <= 0:
+            return None
+        net_gain_pct   = (entry_close - pump_start_ref) / pump_start_ref * 100.0
         if net_gain_pct < Config.PUMP_MIN_PCT:
             return None
 
@@ -1828,114 +1968,227 @@ class Backtester:
 
     def run_backtest(self):
         """
-        Module 1-5 uyumlu bar-by-bar simülasyon (v3).
+        Module 1-5 uyumlu bar-by-bar simülasyon (v3) — KRONOLOJİK UNİFİED TİMELİNE.
 
-        Module 2: 4H kapanan mum → SHORT (pump sonrası ilk mum)
-        Module 3: SL = entry + %15 (entry × 1.15), BE @ %4 düşüş
-        Module 4: Çıkış yalnızca SL / BE / TSL ile
-        Module 5: 24h cooldown sonra yeniden giriş
+        Tüm semboller tek bir zaman ekseni üzerinde işlenir.
+        MAX_ACTIVE_TRADES limiti gerçek zamanlı olarak tüm coinlere uygulanır.
+        Sembol A'nın işlemi kapanmadan Sembol B'de yeni slot açılmaz.
         """
         log.info("=" * 68)
-        log.info("  BACKTEST v3 — Refined Scalper")
+        log.info("  BACKTEST v3 — Refined Scalper (Unified Timeline)")
         log.info(f"  Sermaye: {self.capital:.2f} USDT  |  "
-                 f"Kaldıraç: x{Config.LEVERAGE}  |  Risk/trade: %{Config.RISK_PER_TRADE_PCT}")
+                 f"Kaldıraç: x{Config.LEVERAGE}  |  Risk/trade: %{Config.risk_per_trade_pct()}")
         log.info("=" * 68)
 
         equity = self.capital
         self.equity_curve = [equity]
         active: Dict[str, TradeRecord] = {}
         max_concurrent = 0
-
-        # Breakeven price drop threshold: %4 düşüş
         be_price_drop_pct = Config.BREAKEVEN_DROP_PCT
 
-        for sym, df in self.all_data.items():
-            log.info(f"\n{'─' * 50}")
-            log.info(f"  📊 Sembol: {sym}  |  {len(df)} bar")
-            log.info(f"{'─' * 50}")
+        # Her sembol için ayrı state
+        sym_dfs: Dict[str, pd.DataFrame] = {sym: df.copy() for sym, df in self.all_data.items()}
+        sym_state: Dict[str, dict] = {}
+        sym_ts_to_idx: Dict[str, dict] = {}
+        for sym, df in sym_dfs.items():
+            sym_state[sym] = {
+                "in_watchlist": False,
+                "pump_info": None,
+                "last_exit_price": None,
+                "new_push_seen": True,
+                "pump_cooldown_until_ts": None,   # timestamp bazlı cooldown
+                # 4H gölge state (5m sim karşılaştırması için)
+                "sl_4h":  None,
+                "tsl_4h": False,
+                "be_4h":  False,
+                "ll_4h":  0.0,
+            }
+            sym_ts_to_idx[sym] = {ts: idx for idx, ts in enumerate(df.index)}
 
-            # BB hesapla (tüm veri üzerinde bir kere — şimdilik rapor için tutulabilir)
-            df = df.copy()
+        # Tüm sembollerin timestamplarını birleştir → kronolojik sıralı
+        all_ts = sorted(set().union(*[set(df.index) for df in sym_dfs.values()]))
 
-            in_watchlist = False
-            pump_info: Optional[dict] = None
-            last_exit_price: Optional[float] = None   # Çıkış sonrası yeni push takibi
-            new_push_seen: bool = True                 # İlk giriş ıçin kısıt yok
-            pump_cooldown_until: int = -1              # İlk kırmızı tüketilince 6-bar cooldown
+        log.info(f"\n  🕐 Unified timeline: {len(all_ts)} timestamp, {len(sym_dfs)} sembol\n")
 
-            start_bar = Config.BB_LENGTH + 2
-            daily_df  = None  # detect_pump_at_bar imza uyumu (kullanılmıyor)
+        start_bar = Config.BB_LENGTH + 2
 
-            for i in range(start_bar, len(df)):
+        for ts in all_ts:
+            for sym, df in sym_dfs.items():
+                if ts not in sym_ts_to_idx[sym]:
+                    continue
+                i = sym_ts_to_idx[sym][ts]
+                if i < start_bar:
+                    continue
+
                 bar      = df.iloc[i]
-                bar_time = df.index[i].strftime("%d.%m.%Y %H:%M")
+                bar_dt   = ts
+                bar_time = ts.strftime("%d.%m.%Y %H:%M")
+                state    = sym_state[sym]
+                in_watchlist      = state["in_watchlist"]
+                pump_info         = state["pump_info"]
+                last_exit_price   = state["last_exit_price"]
+                new_push_seen     = state["new_push_seen"]
+                pump_cooldown_ts  = state["pump_cooldown_until_ts"]
 
                 # ═══════════════════════════════════════════════════════
                 # (A) AKTİF TRADE → TSL / GREEN CANDLE KONTROL
+                #     ★ KÖTÜMSERKurgu (Pessimistic Execution) ★
                 # ═══════════════════════════════════════════════════════
                 if sym in active:
                     trade = active[sym]
 
-                    # Stage 1: Breakeven — %4 düşüş → SL = entry
-                    if not trade.breakeven_triggered:
-                        drop_pct = (trade.entry_price - bar["close"]) / trade.entry_price * 100.0
-                        if drop_pct >= be_price_drop_pct:
-                            trade.stop_loss = trade.entry_price
-                            trade.breakeven_triggered = True
-                            trade.sl_moved_to_be = True
-                            log.info(f"  [{bar_time}] ⚡ BE: {sym}  "
-                                     f"Düşüş: %{drop_pct:.1f}")
+                    # ── KURAL 1-3: SL/TSL (5m granüler sim veya 4H fallback) ────
+                    _df5m = self.all_data_5m.get(sym)
+                    if _df5m is not None:
+                        # ── 4H GÖLGE: Paralel 4H tahmini (karşılaştırma için) ────
+                        _sl_4h  = sym_state[sym].get("sl_4h") or trade.stop_loss
+                        _tsl_4h = sym_state[sym].get("tsl_4h", False)
+                        _be_4h  = sym_state[sym].get("be_4h",  False)
+                        _ll_4h  = sym_state[sym].get("ll_4h",  0.0)
+                        if bar["high"] >= _sl_4h and trade.pnl_4h_est == 0.0:
+                            _p4h = (trade.position_size_usdt * trade.leverage *
+                                    (trade.entry_price - _sl_4h) / trade.entry_price)
+                            trade.pnl_4h_est = round(max(_p4h, -trade.position_size_usdt), 2)
+                        else:
+                            if not _be_4h:
+                                if (trade.entry_price - bar["close"]) / trade.entry_price * 100.0 >= be_price_drop_pct:
+                                    _sl_4h = trade.entry_price
+                                    _be_4h = True
+                            _ld = (trade.entry_price - bar["low"]) / trade.entry_price * 100.0
+                            if not _tsl_4h:
+                                if _ld >= Config.TSL_ACTIVATION_DROP_PCT:
+                                    _tsl_4h = True
+                                    _ll_4h  = bar["low"]
+                                    _sl_4h  = min(_sl_4h, _ll_4h * (1 + Config.TSL_TRAIL_PCT / 100.0))
+                            else:
+                                if bar["low"] < _ll_4h:
+                                    _ll_4h = bar["low"]
+                                    _sl_4h = min(_sl_4h, _ll_4h * (1 + Config.TSL_TRAIL_PCT / 100.0))
+                        sym_state[sym].update({"sl_4h": _sl_4h, "tsl_4h": _tsl_4h,
+                                               "be_4h": _be_4h, "ll_4h":  _ll_4h})
 
-                    # Stage 2: TSL — %8 düşüşte aktif, SL = lowest_low × 1.03
-                    low_drop_pct = (trade.entry_price - bar["low"]) / trade.entry_price * 100.0
-                    if not trade.tsl_active:
-                        if low_drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
-                            trade.tsl_active = True
-                            trade.lowest_low_reached = bar["low"]
-                            new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
-                            trade.stop_loss = min(trade.stop_loss, new_sl)
-                            log.info(f"  [{bar_time}] 🎯 TSL AKTİF: {sym}  "
-                                     f"Low: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
+                        # ── 5m İNTRA-BAR SİMÜLASYON ──────────────────────────
+                        _exit = self.simulate_intra_bar_exit(ts, trade, _df5m, be_price_drop_pct)
+                        if _exit:
+                            exit_p  = _exit["exit_price"]
+                            exit_t  = _exit["exit_time"]
+                            reason  = _exit["exit_reason"]
+                            pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
+                            pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
+                            pnl_usd = max(pnl_usd, -trade.position_size_usdt)
+                            if trade.pnl_4h_est == 0.0:
+                                trade.pnl_4h_est = round(pnl_usd, 2)
+                            trade.exit_time   = exit_t
+                            trade.exit_price  = exit_p
+                            trade.exit_reason = reason
+                            trade.pnl_pct     = round(pnl_pct * 100, 4)
+                            trade.pnl_usdt    = round(pnl_usd, 2)
+                            equity += pnl_usd
+                            self.equity_curve.append(equity)
+                            trade.portfolio_after = round(equity, 2)
+                            self.trades.append(trade)
+                            del active[sym]
+                            last_exit_price = exit_p
+                            new_push_seen   = False
+                            pump_info       = self.detect_pump_at_bar(df, i, None)
+                            in_watchlist    = pump_info is not None
+                            log.info(f"  [{exit_t}] 🔴 {reason}[5m] — {sym}  Exit: {exit_p:.6f}  PnL: {pnl_usd:+.2f}  Kasa: {equity:.0f}$")
+                            sym_state[sym].update({
+                                "in_watchlist": in_watchlist, "pump_info": pump_info,
+                                "last_exit_price": last_exit_price, "new_push_seen": new_push_seen,
+                                "sl_4h": None, "tsl_4h": False, "be_4h": False, "ll_4h": 0.0,
+                            })
+                            continue
+                        # 5m simülasyonunda bu bar'da çıkış yok → KURAL 4'e devam
+
                     else:
-                        if bar["low"] < trade.lowest_low_reached:
-                            trade.lowest_low_reached = bar["low"]
-                            new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
-                            trade.stop_loss = min(trade.stop_loss, new_sl)
+                        # ── 4H FALLBACK: 5m veri yoksa orijinal KURAL 1/2/3 ──
+                        if bar["high"] >= trade.stop_loss:
+                            exit_p  = trade.stop_loss
+                            pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
+                            pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
+                            pnl_usd = max(pnl_usd, -trade.position_size_usdt)
+                            reason  = "TSL-HIT" if trade.tsl_active else "STOP-LOSS"
+                            trade.pnl_4h_est  = round(pnl_usd, 2)
+                            trade.exit_time   = bar_time
+                            trade.exit_price  = exit_p
+                            trade.exit_reason = reason
+                            trade.pnl_pct     = round(pnl_pct * 100, 4)
+                            trade.pnl_usdt    = round(pnl_usd, 2)
+                            equity += pnl_usd
+                            self.equity_curve.append(equity)
+                            trade.portfolio_after = round(equity, 2)
+                            self.trades.append(trade)
+                            del active[sym]
+                            last_exit_price = exit_p
+                            new_push_seen   = False
+                            pump_info       = self.detect_pump_at_bar(df, i, None)
+                            in_watchlist    = pump_info is not None
+                            log.info(f"  [{bar_time}] 🔴 {reason} — {sym}  Exit: {exit_p:.6f}  PnL: {pnl_usd:+.2f}  Kasa: {equity:.0f}$")
+                            sym_state[sym]["in_watchlist"]    = in_watchlist
+                            sym_state[sym]["pump_info"]       = pump_info
+                            sym_state[sym]["last_exit_price"] = last_exit_price
+                            sym_state[sym]["new_push_seen"]   = new_push_seen
+                            continue
 
-                    # Stage 3: SL kontrolü (HIGH-BASED)
-                    # Exchange stop_market emri mum içi HIGH stop fiyatına değer değmez tetiklenir
-                    if bar["high"] >= trade.stop_loss:
-                        exit_p  = trade.stop_loss
-                        pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
-                        pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
-                        pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin (likit sınırı)
-                        reason  = "TSL-HIT" if trade.tsl_active else "STOP-LOSS"
-                        trade.exit_time   = bar_time
-                        trade.exit_price  = exit_p
-                        trade.exit_reason = reason
-                        trade.pnl_pct     = round(pnl_pct * 100, 4)
-                        trade.pnl_usdt    = round(pnl_usd, 2)
-                        equity += pnl_usd
-                        self.equity_curve.append(equity)
-                        self.trades.append(trade)
-                        del active[sym]
-                        last_exit_price = exit_p
-                        new_push_seen = False
-                        pump_info = self.detect_pump_at_bar(df, i, daily_df)
-                        in_watchlist = pump_info is not None
-                        log.info(f"  [{bar_time}] 🔴 {reason} — {sym}  "
-                                 f"Exit: {exit_p:.6f}  PnL: {pnl_usd:+.2f}")
-                        continue
+                        if not trade.breakeven_triggered:
+                            drop_pct = (trade.entry_price - bar["close"]) / trade.entry_price * 100.0
+                            if drop_pct >= be_price_drop_pct:
+                                trade.stop_loss = trade.entry_price
+                                trade.breakeven_triggered = True
+                                trade.sl_moved_to_be = True
+                                log.info(f"  [{bar_time}] ⚡ BE: {sym}  Düşüş: %{drop_pct:.1f}")
 
-                    # Stage 4: Zararda yeşil mum → SHORT kapat
+                        low_drop_pct = (trade.entry_price - bar["low"]) / trade.entry_price * 100.0
+                        if not trade.tsl_active:
+                            if low_drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
+                                trade.tsl_active = True
+                                trade.lowest_low_reached = bar["low"]
+                                new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
+                                trade.stop_loss = min(trade.stop_loss, new_sl)
+                                log.info(f"  [{bar_time}] 🎯 TSL AKTİF: {sym}  "
+                                         f"Low: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
+                        else:
+                            if bar["low"] < trade.lowest_low_reached:
+                                trade.lowest_low_reached = bar["low"]
+                                new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
+                                trade.stop_loss = min(trade.stop_loss, new_sl)
+
+                        if trade.tsl_active and bar["close"] >= trade.stop_loss:
+                            exit_p  = trade.stop_loss
+                            pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
+                            pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
+                            pnl_usd = max(pnl_usd, -trade.position_size_usdt)
+                            trade.pnl_4h_est  = round(pnl_usd, 2)
+                            trade.exit_time   = bar_time
+                            trade.exit_price  = exit_p
+                            trade.exit_reason = "TSL-HIT"
+                            trade.pnl_pct     = round(pnl_pct * 100, 4)
+                            trade.pnl_usdt    = round(pnl_usd, 2)
+                            equity += pnl_usd
+                            self.equity_curve.append(equity)
+                            trade.portfolio_after = round(equity, 2)
+                            self.trades.append(trade)
+                            del active[sym]
+                            last_exit_price = exit_p
+                            new_push_seen   = False
+                            pump_info       = self.detect_pump_at_bar(df, i, None)
+                            in_watchlist    = pump_info is not None
+                            log.info(f"  [{bar_time}] 🎯 TSL-HIT (bounce): {sym}  Exit: {exit_p:.6f}  PnL: {pnl_usd:+.2f}  Kasa: {equity:.0f}$")
+                            sym_state[sym]["in_watchlist"]    = in_watchlist
+                            sym_state[sym]["pump_info"]       = pump_info
+                            sym_state[sym]["last_exit_price"] = last_exit_price
+                            sym_state[sym]["new_push_seen"]   = new_push_seen
+                            continue
+
+                    # ── KURAL 4: ZARARDA YEŞİL MUM (GREEN-10) ────────────
                     if bar["close"] > bar["open"] and bar["close"] > trade.entry_price:
                         green_body_pct = (bar["close"] - bar["open"]) / bar["open"] * 100.0
-                        # Zararda tek yeşil mum gövdesi >= %10 → anında kapat (reversal olmadı)
                         if green_body_pct >= Config.GREEN_LOSS_SINGLE_BODY_PCT:
                             exit_p  = bar["close"]
                             pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
                             pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
-                            pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin
+                            pnl_usd = max(pnl_usd, -trade.position_size_usdt)
                             trade.exit_time   = bar_time
                             trade.exit_price  = exit_p
                             trade.exit_reason = "GREEN-10"
@@ -1943,22 +2196,25 @@ class Backtester:
                             trade.pnl_usdt    = round(pnl_usd, 2)
                             equity += pnl_usd
                             self.equity_curve.append(equity)
+                            trade.portfolio_after = round(equity, 2)
                             self.trades.append(trade)
                             del active[sym]
                             last_exit_price = exit_p
-                            new_push_seen = False
-                            pump_info = self.detect_pump_at_bar(df, i, daily_df)
-                            in_watchlist = pump_info is not None
-                            log.info(f"  [{bar_time}] 🟠 GREEN-10: {sym}  "
-                                     f"Gövde: %{green_body_pct:.1f}  Exit: {exit_p:.6f}  PnL: {pnl_usd:+.2f}")
+                            new_push_seen   = False
+                            pump_info       = self.detect_pump_at_bar(df, i, None)
+                            in_watchlist    = pump_info is not None
+                            log.info(f"  [{bar_time}] 🟠 GREEN-10: {sym}  Gövde: %{green_body_pct:.1f}  Exit: {exit_p:.6f}  PnL: {pnl_usd:+.2f}  Kasa: {equity:.0f}$")
+                            sym_state[sym]["in_watchlist"]    = in_watchlist
+                            sym_state[sym]["pump_info"]       = pump_info
+                            sym_state[sym]["last_exit_price"] = last_exit_price
+                            sym_state[sym]["new_push_seen"]   = new_push_seen
                             continue
-                        # Küçük zararda yeşil → sayacı artır, 2'de kapat
                         trade.consec_green_loss += 1
                         if trade.consec_green_loss >= 2:
                             exit_p  = bar["close"]
                             pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
                             pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
-                            pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin
+                            pnl_usd = max(pnl_usd, -trade.position_size_usdt)
                             trade.exit_time   = bar_time
                             trade.exit_price  = exit_p
                             trade.exit_reason = "2xGREEN-LOSS"
@@ -1966,44 +2222,49 @@ class Backtester:
                             trade.pnl_usdt    = round(pnl_usd, 2)
                             equity += pnl_usd
                             self.equity_curve.append(equity)
+                            trade.portfolio_after = round(equity, 2)
                             self.trades.append(trade)
                             del active[sym]
                             last_exit_price = exit_p
-                            new_push_seen = False
-                            pump_info = self.detect_pump_at_bar(df, i, daily_df)
-                            in_watchlist = pump_info is not None
-                            log.info(f"  [{bar_time}] 🟠 2xGREEN-LOSS: {sym}  "
-                                     f"Exit: {exit_p:.6f}  PnL: {pnl_usd:+.2f}")
+                            new_push_seen   = False
+                            pump_info       = self.detect_pump_at_bar(df, i, None)
+                            in_watchlist    = pump_info is not None
+                            log.info(f"  [{bar_time}] 🟠 2xGREEN-LOSS: {sym}  Exit: {exit_p:.6f}  PnL: {pnl_usd:+.2f}  Kasa: {equity:.0f}$")
+                            sym_state[sym]["in_watchlist"]    = in_watchlist
+                            sym_state[sym]["pump_info"]       = pump_info
+                            sym_state[sym]["last_exit_price"] = last_exit_price
+                            sym_state[sym]["new_push_seen"]   = new_push_seen
                             continue
                     else:
-                        trade.consec_green_loss = 0  # Kırmızı veya kârda yeşil → sayacı sıfırla
+                        trade.consec_green_loss = 0
 
                     continue  # Trade hâlâ açık
 
                 # ═══════════════════════════════════════════════════════
                 # (B) PUMP TESPİTİ — WATCHLIST
                 # ═══════════════════════════════════════════════════════
-                # Yeni push takibi: çıkış sonrası fiyat eski seviyeyi geçti mi?
                 if last_exit_price is not None and not new_push_seen:
                     if bar["high"] > last_exit_price:
                         new_push_seen = True
                         log.info(f"  [{bar_time}] 🔄 YENİ PUSH: {sym}  H: {bar['high']:.6f}")
                 if not in_watchlist:
-                    if i < pump_cooldown_until:
-                        pass  # Cooldown aktif — eski pump penceresi henüz bitmedi
+                    # Cooldown: timestamp bazlı
+                    if pump_cooldown_ts is not None and ts < pump_cooldown_ts:
+                        pass  # Cooldown aktif
                     else:
-                        pump_info = self.detect_pump_at_bar(df, i, daily_df)
+                        pump_info = self.detect_pump_at_bar(df, i, None)
                         if pump_info:
                             in_watchlist = True
                             log.info(f"  [{bar_time}] 🚨 Pump: {sym}  "
                                      f"+{pump_info['pump_pct']:.1f}%  "
                                      f"Zirve: {pump_info['pump_high']:.6f}")
                 else:
-                    # Pump hâlâ geçerli mi?
-                    check = self.detect_pump_at_bar(df, i, daily_df)
+                    check = self.detect_pump_at_bar(df, i, None)
                     if check is None:
                         in_watchlist = False
-                        pump_info = None
+                        pump_info    = None
+                        sym_state[sym]["in_watchlist"] = False
+                        sym_state[sym]["pump_info"]    = None
                         continue
                     pump_info["pump_high"] = max(pump_info["pump_high"], check["pump_high"])
 
@@ -2011,92 +2272,138 @@ class Backtester:
                 # (C) GİRİŞ: Kırmızı mum → SHORT
                 # ═══════════════════════════════════════════════════════
                 if not in_watchlist or pump_info is None:
+                    sym_state[sym]["in_watchlist"] = in_watchlist
+                    sym_state[sym]["pump_info"]    = pump_info
+                    sym_state[sym]["new_push_seen"] = new_push_seen
                     continue
-                # Module 5: Yeni push koşulu (çıkış sonrası yeniden giriş)
                 if not new_push_seen:
-                    continue  # Çıkış sonrası yeni push bekleniyor
+                    sym_state[sym]["in_watchlist"] = in_watchlist
+                    sym_state[sym]["pump_info"]    = pump_info
+                    sym_state[sym]["new_push_seen"] = new_push_seen
+                    continue
 
-                # Module 2: Kırmızı mum → SHORT
+                # Tarih aralığı filtresi: start_dt öncesi barlarda giriş açma
+                if bar_dt < self.start_dt:
+                    sym_state[sym]["in_watchlist"] = in_watchlist
+                    sym_state[sym]["pump_info"]    = pump_info
+                    sym_state[sym]["new_push_seen"] = new_push_seen
+                    continue
+
                 if bar["close"] >= bar["open"]:
-                    continue  # Yeşil mum, giriş yok
+                    sym_state[sym]["in_watchlist"] = in_watchlist
+                    sym_state[sym]["pump_info"]    = pump_info
+                    sym_state[sym]["new_push_seen"] = new_push_seen
+                    continue
 
-                # Solid Red: gövde en az %X düşüş olmalı (doji filtresi)
                 red_body_pct = (bar["open"] - bar["close"]) / bar["open"] * 100.0
 
-                entry_p = bar["close"]
+                # ── GERÇEKÇİ GİRİŞ FİYATI: Sinyal mumunun kapanışında değil,
+                #    Sinyal barı kapatıktan sonraki ilk 5m mumun AÇILIŞI kullanılır.
+                #    Önceliğ: 5m veri → sonraki 4H bar openı → fallback bar["close"]
+                _entry_ts5 = ts + pd.Timedelta(hours=4)
+                _df5m_sym  = self.all_data_5m.get(sym)
+                if _df5m_sym is not None and _entry_ts5 in _df5m_sym.index:
+                    entry_p       = _df5m_sym.loc[_entry_ts5]["open"]
+                    entry_time_bt = _entry_ts5.strftime("%d.%m.%Y %H:%M")
+                elif i + 1 < len(df):
+                    entry_p       = df.iloc[i + 1]["open"]
+                    entry_time_bt = df.index[i + 1].strftime("%d.%m.%Y %H:%M")
+                else:
+                    entry_p       = bar["close"]
+                    entry_time_bt = bar_time
 
-                # Module 2b: Pump zirvesinin altına düşmeli (peak geçildi teyidi)
                 if entry_p >= pump_info["pump_high"]:
                     pump_info["pump_high"] = max(pump_info["pump_high"], bar["high"])
-                    continue  # Fiyat hâlâ pump zirvesinde — peak güncellendi, giriş yok
+                    sym_state[sym]["in_watchlist"] = in_watchlist
+                    sym_state[sym]["pump_info"]    = pump_info
+                    sym_state[sym]["new_push_seen"] = new_push_seen
+                    continue
 
-                # ─── İLK GEÇERLİ KIRMIZI MUM — sinyal bu bar tüketildi ────────────────
-                # Gövde küçükse (≤%2) sinyal yanmaz, bir sonraki kırmızı mumda tekrar değerlendirilir
                 if red_body_pct < Config.ENTRY_RED_BODY_MIN_PCT:
-                    continue  # Cılız kırmızı: bekle, sinyal yanmadı
-
-                # Önceki mum yeşil ve gövdesi max %30 olmalı (sahte kırmızı filtresi)
+                    sym_state[sym]["in_watchlist"] = in_watchlist
+                    sym_state[sym]["pump_info"]    = pump_info
+                    sym_state[sym]["new_push_seen"] = new_push_seen
+                    continue
                 prev_bar = df.iloc[i - 1]
                 if prev_bar["close"] <= prev_bar["open"]:
-                    continue  # önceki mum yeşil değil — giriş yok
+                    sym_state[sym]["in_watchlist"] = in_watchlist
+                    sym_state[sym]["pump_info"]    = pump_info
+                    sym_state[sym]["new_push_seen"] = new_push_seen
+                    continue
                 prev_body_pct = (prev_bar["close"] - prev_bar["open"]) / prev_bar["open"] * 100.0
-                if prev_body_pct >= Config.ANTI_ROCKET_SINGLE_CANDLE_PCT:  # >= : canlı bot ile aynı
-                    continue  # önceki yeşil mum fazla büyük — sahte kırmızı riski
+                if prev_body_pct >= Config.ANTI_ROCKET_SINGLE_CANDLE_PCT:
+                    sym_state[sym]["in_watchlist"] = in_watchlist
+                    sym_state[sym]["pump_info"]    = pump_info
+                    sym_state[sym]["new_push_seen"] = new_push_seen
+                    continue
 
-                pi_saved = pump_info
+                pi_saved     = pump_info
                 in_watchlist = False
-                pump_info = None
-                pump_cooldown_until = i + Config.PUMP_CONSECUTIVE_GREEN
+                pump_info    = None
+                # Cooldown: PUMP_CONSECUTIVE_GREEN × 4H = timestamp
+                pump_cooldown_ts = ts + timedelta(hours=Config.PUMP_CONSECUTIVE_GREEN * 4)
 
-                if equity < 100.0:
-                    log.info(f"  [{bar_time}] ⛔ EQUİTY<100$ ({equity:.0f}$): {sym} — sinyal iptal")
+                pos_margin = equity / Config.MAX_ACTIVE_TRADES
+                if pos_margin < 10.0:
+                    log.info(f"  [{bar_time}] ⛔ SLOT BOÜÇ ({pos_margin:.0f}$ < 10$): {sym} — sinyal iptal")
+                    sym_state[sym]["in_watchlist"]          = in_watchlist
+                    sym_state[sym]["pump_info"]             = pump_info
+                    sym_state[sym]["new_push_seen"]         = new_push_seen
+                    sym_state[sym]["pump_cooldown_until_ts"]= pump_cooldown_ts
                     continue
 
                 if len(active) >= Config.MAX_ACTIVE_TRADES:
-                    log.info(f"  [{bar_time}] ⛔ SLOT DOLU — ilk kırmızı kaçırıldı: {sym} — sinyal iptal")
+                    log.info(f"  [{bar_time}] ⛔ SLOT DOLU ({len(active)}/{Config.MAX_ACTIVE_TRADES}) — {sym} sinyal iptal")
+                    sym_state[sym]["in_watchlist"]          = in_watchlist
+                    sym_state[sym]["pump_info"]             = pump_info
+                    sym_state[sym]["new_push_seen"]         = new_push_seen
+                    sym_state[sym]["pump_cooldown_until_ts"]= pump_cooldown_ts
                     continue
 
-                # Dinamik kaldıraç: 100-200$ arası → 4x, 200$+ → 3x
-                lev = 4 if equity < 200.0 else Config.LEVERAGE
-
-                # SL: Giriş fiyatının %15 üstü (entry × 1.15)
-                sl = entry_p * (1 + Config.SL_ABOVE_ENTRY_PCT / 100.0)
-
-                # Pozisyon büyüklüğü
-                if equity < 200.0:
-                    pos_margin = equity  # Tek pozisyon, tüm equity
-                else:
-                    pos_margin = equity / Config.MAX_ACTIVE_TRADES
+                lev = Config.LEVERAGE
+                sl  = entry_p * (1 + Config.SL_ABOVE_ENTRY_PCT / 100.0)
 
                 trade = TradeRecord(
                     symbol=sym, side="SHORT",
-                    entry_time=bar_time, entry_price=entry_p,
+                    entry_time=entry_time_bt, entry_price=entry_p,
                     stop_loss=sl, initial_stop_loss=sl,
                     tp1_price=0.0, tp2_price=0.0,
                     position_size_usdt=pos_margin, remaining_pct=1.0,
                     pump_pct=pi_saved["pump_pct"],
                     pump_high=pi_saved["pump_high"],
                     pump_low=pi_saved["pump_low"],
-                    entry_candle_open=bar["open"],
+                    entry_candle_open=entry_p,
                     leverage=lev,
                 )
                 active[sym] = trade
                 max_concurrent = max(max_concurrent, len(active))
-                log.info(f"  [{bar_time}] ✅ SHORT: {sym}  "
+                # 4H gölge SL state'ini başlat (5m sim karşılaştırması için)
+                sym_state[sym]["sl_4h"]  = sl
+                sym_state[sym]["tsl_4h"] = False
+                sym_state[sym]["be_4h"]  = False
+                sym_state[sym]["ll_4h"]  = 0.0
+                log.info(f"  [{entry_time_bt}] ✅ SHORT: {sym}  "
                          f"Giriş: {entry_p:.6f}  SL: {sl:.6f}  "
-                         f"Pump: +{pi_saved['pump_pct']:.1f}%  Kaldıraç: x{lev}")
+                         f"Pump: +{pi_saved['pump_pct']:.1f}%  Kaldıraç: x{lev}  "
+                         f"Bağlanan: {pos_margin:.0f}$  Kasa: {equity:.0f}$  "
+                         f"Slot: {len(active)}/{Config.MAX_ACTIVE_TRADES}  [Sinyal: {bar_time}]")
+
+                sym_state[sym]["in_watchlist"]           = in_watchlist
+                sym_state[sym]["pump_info"]              = pump_info
+                sym_state[sym]["new_push_seen"]          = new_push_seen
+                sym_state[sym]["pump_cooldown_until_ts"] = pump_cooldown_ts
 
         # ── Backtest sonu: açık kalan trade'leri kapat ────────────────
-        for sym, trade in active.items():
+        for sym, trade in list(active.items()):
             if sym in self.all_data and not self.all_data[sym].empty:
                 df_sim = self.all_data[sym]
-                df_sim = df_sim[df_sim.index <= self.end_dt]
+                df_sim = df_sim[df_sim.index <= pd.Timestamp(self.end_dt)]
                 if df_sim.empty:
                     continue
                 exit_p  = df_sim["close"].iloc[-1]
                 pnl_pct = (trade.entry_price - exit_p) / trade.entry_price
                 pnl_usd = trade.position_size_usdt * trade.leverage * pnl_pct
-                pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin
+                pnl_usd = max(pnl_usd, -trade.position_size_usdt)
                 trade.exit_time   = df_sim.index[-1].strftime("%d.%m.%Y %H:%M")
                 trade.exit_price  = exit_p
                 trade.exit_reason = "BT-END"
@@ -2104,8 +2411,9 @@ class Backtester:
                 trade.pnl_usdt    = round(pnl_usd, 2)
                 equity += pnl_usd
                 self.equity_curve.append(equity)
+                trade.portfolio_after = round(equity, 2)
                 self.trades.append(trade)
-                log.info(f"  [BT-END] 🔵 {sym}  PnL: {pnl_usd:+.2f}")
+                log.info(f"  [BT-END] 🔵 {sym}  PnL: {pnl_usd:+.2f}  Kasa: {equity:.0f}$")
 
         self.equity_curve.append(equity)
         log.info(f"\n  Max eşzamanlı trade: {max_concurrent}")
@@ -2172,9 +2480,15 @@ class Backtester:
 """)
 
         # ── Trade-by-Trade Log ────────────────────────────────────────
-        print("  ┌─────┬────────────┬──────────────────┬────────────┬────────────┬────────────┬────────────┬────────────────┬────────────┐")
-        print("  │  #  │  Sembol    │  Giriş Zamanı    │  Giriş Fiy │  İlk SL    │  Son SL    │  Çıkış Fiy │  Çıkış Nedeni  │  PnL (USDT)│")
-        print("  ├─────┼────────────┼──────────────────┼────────────┼────────────┼────────────┼────────────┼────────────────┼────────────┤")
+        has_4h = any(t.pnl_4h_est != 0.0 for t in self.trades)
+        if has_4h:
+            print("  ┌─────┬────────────┬──────────────────┬────────────┬────────────┬────────────┬────────────┬────────────────┬────────────┬────────────┐")
+            print("  │  #  │  Sembol    │  Giriş Zamanı    │  Giriş Fiy │  İlk SL    │  Son SL    │  Çıkış Fiy │  Çıkış Nedeni  │ PnL 5m(USDT│ PnL 4H Est │")
+            print("  ├─────┼────────────┼──────────────────┼────────────┼────────────┼────────────┼────────────┼────────────────┼────────────┼────────────┤")
+        else:
+            print("  ┌─────┬────────────┬──────────────────┬────────────┬────────────┬────────────┬────────────┬────────────────┬────────────┐")
+            print("  │  #  │  Sembol    │  Giriş Zamanı    │  Giriş Fiy │  İlk SL    │  Son SL    │  Çıkış Fiy │  Çıkış Nedeni  │  PnL (USDT)│")
+            print("  ├─────┼────────────┼──────────────────┼────────────┼────────────┼────────────┼────────────┼────────────────┼────────────┤")
 
         for idx, t in enumerate(self.trades, 1):
             sym_short  = t.symbol.replace("/USDT", "").ljust(10)
@@ -2185,10 +2499,18 @@ class Backtester:
             exit_p_str = f"{t.exit_price:<10.6f}"
             reason     = t.exit_reason[:14].ljust(14)
             pnl_str    = f"{t.pnl_usdt:>+10.2f}"
+            if has_4h:
+                pnl_4h_str = f"{t.pnl_4h_est:>+10.2f}"
+                diff_sign  = "↑" if t.pnl_4h_est > t.pnl_usdt else ("↓" if t.pnl_4h_est < t.pnl_usdt else " ")
+                print(f"  │ {idx:>3} │ {sym_short}│ {entry_t} │ {entry_p} │ {sl_p} │ {tp_p} │ {exit_p_str} │ {reason} │ {pnl_str} │ {pnl_4h_str}{diff_sign}│")
+            else:
+                print(f"  │ {idx:>3} │ {sym_short}│ {entry_t} │ {entry_p} │ {sl_p} │ {tp_p} │ {exit_p_str} │ {reason} │ {pnl_str} │")
 
-            print(f"  │ {idx:>3} │ {sym_short}│ {entry_t} │ {entry_p} │ {sl_p} │ {tp_p} │ {exit_p_str} │ {reason} │ {pnl_str} │")
-
-        print("  └─────┴────────────┴──────────────────┴────────────┴────────────┴────────────┴────────────┴────────────────┴────────────┘")
+        if has_4h:
+            print("  └─────┴────────────┴──────────────────┴────────────┴────────────┴────────────┴────────────┴────────────────┴────────────┴────────────┘")
+            print("  (↑ = 4H tahmini daha iyi  |  ↓ = 4H tahmini daha kötü  |  4H Est gerçekçi değil, karşılaştırma içindir)")
+        else:
+            print("  └─────┴────────────┴──────────────────┴────────────┴────────────┴────────────┴────────────┴────────────────┴────────────┘")
 
         # ── Sembol Bazlı Özet ─────────────────────────────────────────
         print("\n  📈 Sembol Bazlı Özet:")
@@ -2204,7 +2526,384 @@ class Backtester:
             print(f"  {sym:<16}  Trade: {s_total:>3}  |  "
                   f"Kazanma: {s_wins}/{s_total}  |  Net PnL: {s_pnl:>+10.2f} USDT")
 
+        # ── 5m Simülasyon vs 4H Tahmini Karşılaştırması ──────────────
+        trades_with_cmp = [t for t in self.trades if t.pnl_4h_est != 0.0]
+        if trades_with_cmp:
+            pnl_5m_total = sum(t.pnl_usdt    for t in self.trades)
+            pnl_4h_total = sum(t.pnl_4h_est  for t in self.trades)
+            diff         = pnl_5m_total - pnl_4h_total
+
+            # 4H tahmini equity eğrisi
+            eq_4h   = [self.capital]
+            for t in self.trades:
+                eq_4h.append(eq_4h[-1] + t.pnl_4h_est)
+            peak_4h = eq_4h[0]; mdd_4h = 0.0
+            for v in eq_4h:
+                if v > peak_4h:
+                    peak_4h = v
+                dd = (peak_4h - v) / peak_4h * 100.0 if peak_4h > 0 else 0.0
+                if dd > mdd_4h:
+                    mdd_4h = dd
+
+            sign = "+" if diff >= 0 else ""
+            print(f"""
+  ┌──────────────────────────────────────────────────────┐
+  │     5m SİMÜLASYON  vs  4H TAHMİN KARŞILAŞTIRMASI   │
+  ├──────────────────────────────────────────────────────┤
+  │  Gerçekçi Net PnL (5m)  : {pnl_5m_total:>+12,.2f} USDT        │
+  │  Tahmini Net PnL  (4H)  : {pnl_4h_total:>+12,.2f} USDT        │
+  │  Fark  (5m – 4H)        : {sign}{abs(diff):>11,.2f} USDT        │
+  ├──────────────────────────────────────────────────────┤
+  │  5m Maks Drawdown       : {max_dd:>10.2f} %              │
+  │  4H Tahmini Maks DD     : {mdd_4h:>10.2f} %              │
+  └──────────────────────────────────────────────────────┘""")
+
         print("\n" + "═" * 80)
+
+    # ─────────────────────────────────────────────────────────────────
+    # 3.4  5m DOĞRULAMA — Kârlı tradeler (backtest bittikten sonra)
+    # ─────────────────────────────────────────────────────────────────
+
+    def verify_profits_5m(self):
+        """
+        İki aşamalı backtest doğrulama motoru.
+
+        AŞAMA 1 — 4H Kaba Analiz (Baseline)
+          Backtest'ten gelen tüm işlemleri 4H sonuçlarıyla tablola.
+          Toplam bakiye, win-rate, kâr/zarar dağılımı.
+
+        AŞAMA 2 — 5m Hassas Doğrulama (Refinement)
+          Filtre: pnl_usdt > 0 VEYA exit_reason == 'TSL-HIT'
+          Her işlem için entry_time → 4H exit_time arasındaki 5m mumları tara.
+          HIGH-first kötümser sıra:
+            1) HIGH >= mevcut SL → anında çıkış (TSL/BE değişmeden önce)
+            2) Breakeven: close %BE_PCT düştüyse SL=entry; tekrar HIGH kontrolü
+            3) TSL aktivasyon + güncelleme (low bazlı)
+          Çıkış nedeni: '5m_TSL_HIT' veya '5m_SL_HIT'
+
+        AŞAMA 3 — Karşılaştırmalı Rapor
+          df_4h_results  : 4H iyimser tablo (tüm işlemler)
+          df_5m_results  : 5m doğrulanmış tablo (filtreli işlemler, güncel PnL)
+          Net kâr/zarar karşılaştırması
+        """
+        be_p  = Config.BREAKEVEN_DROP_PCT
+        tsl_a = Config.TSL_ACTIVATION_DROP_PCT
+        tsl_t = Config.TSL_TRAIL_PCT
+        sl_i  = Config.SL_ABOVE_ENTRY_PCT
+
+        # ══════════════════════════════════════════════════════════════
+        # AŞAMA 1 — 4H Baseline Tablosu
+        # ══════════════════════════════════════════════════════════════
+        print("\n")
+        print("═" * 100)
+        print("  📊  AŞAMA 1 — 4H KABA ANALİZ (Baseline)")
+        print("═" * 100)
+
+        rows_4h = []
+        for t in self.trades:
+            rows_4h.append({
+                "Sembol":      t.symbol.replace("/USDT","").replace(":USDT",""),
+                "Giriş":       t.entry_time,
+                "Giriş Fiy":   t.entry_price,
+                "İlk SL":      t.initial_stop_loss,
+                "Son SL":      t.stop_loss,
+                "Çıkış Fiy":   t.exit_price,
+                "Çıkış Ned":   t.exit_reason,
+                "PnL (USDT)":  t.pnl_usdt,
+                "Durum":       "✅ KÂR" if t.pnl_usdt > 0 else "🔴 ZARAR",
+            })
+
+        df_4h = pd.DataFrame(rows_4h)
+        total_4h   = len(df_4h)
+        winners_4h = (df_4h["PnL (USDT)"] > 0).sum()
+        net_4h     = df_4h["PnL (USDT)"].sum()
+
+        print(f"\n  Toplam: {total_4h}  |  Kârlı: {winners_4h}  |  Zararlı: {total_4h-winners_4h}  |  Win Rate: %{winners_4h/total_4h*100:.1f}" if total_4h else "\n  Trade yok.")
+        print(f"  4H Net PnL: {net_4h:>+.2f} USDT\n")
+
+        # Tablo başlığı
+        W = 109
+        print("  ┌" + "─"*(W-2) + "┐")
+        h = f"  {'#':>3}  {'Sembol':<12}  {'Giriş Zamanı':>16}  {'Giriş Fiy':>11}  {'İlk SL':>11}  {'Son SL':>11}  {'Çıkış Fiy':>11}  {'Çıkış Nedeni':<14}  {'PnL':>10}  {'Durum'}"
+        print("  │" + h + " "*(W-2-len(h)) + "│")
+        print("  ├" + "─"*(W-2) + "┤")
+        for i, t in enumerate(self.trades, 1):
+            sym = t.symbol.replace("/USDT","").replace(":USDT","")
+            pnl_str = f"{t.pnl_usdt:>+10.2f}"
+            icon    = "✅" if t.pnl_usdt > 0 else "🔴"
+            row = (f"  {i:>3}  {sym:<12}  {t.entry_time[:16]:>16}  "
+                   f"{t.entry_price:>11.6f}  {t.initial_stop_loss:>11.6f}  "
+                   f"{t.stop_loss:>11.6f}  {t.exit_price:>11.6f}  "
+                   f"{t.exit_reason:<14}  {pnl_str}  {icon}")
+            print("  │" + row + " "*(W-2-len(row)) + "│")
+        print("  ├" + "═"*(W-2) + "┤")
+        foot = f"  {'TOPLAM':<16}  {'':>16}  {'':>11}  {'':>11}  {'':>11}  {'':>11}  {'':>14}  {net_4h:>+10.2f}"
+        print("  │" + foot + " "*(W-2-len(foot)) + "│")
+        print("  └" + "─"*(W-2) + "┘")
+
+        # ══════════════════════════════════════════════════════════════
+        # AŞAMA 2 — 5m Hassas Doğrulama
+        # ══════════════════════════════════════════════════════════════
+        print("\n")
+        print("═" * 100)
+        print("  🔍  AŞAMA 2 — 5m HASSAS DOĞRULAMA (Refinement)")
+        print("═" * 100)
+        print(f"  Parametreler: BE@%{be_p:.0f}  TSL-Akt@%{tsl_a:.0f}  TSL-Trail@%{tsl_t:.0f}  İlk-SL@%{sl_i:.0f}")
+
+        # Filtre: pnl > 0 VEYA exit_reason == TSL-HIT
+        candidates = [t for t in self.trades if t.pnl_usdt > 0 or t.exit_reason == "TSL-HIT"]
+        print(f"  Filtre (pnl>0 VEYA TSL-HIT): {len(candidates)}/{total_4h} işlem seçildi")
+
+        if not candidates:
+            print("\n  ⚠  Doğrulanacak işlem yok.")
+            print("═" * 100)
+            return
+
+        if not self.all_data_5m:
+            print("\n  ⚠  5m veri mevcut değil — Aşama 2 atlanıyor.")
+            print("═" * 100)
+            return
+
+        syms_missing = set(t.symbol for t in candidates if self.all_data_5m.get(t.symbol) is None)
+        if syms_missing:
+            print(f"  ⚠  5m verisi eksik: {', '.join(s.replace('/USDT','') for s in syms_missing)}")
+        print()
+
+        verified = []   # (trade, exit_info_or_None, note)
+
+        for idx, trade in enumerate(candidates, 1):
+            sym_short = trade.symbol.replace("/USDT","").replace(":USDT","")
+            print(f"  [{idx:>2}/{len(candidates)}] {sym_short:<12}  "
+                  f"4H: {trade.exit_reason:<10} {trade.pnl_usdt:>+8.2f}$  →  ",
+                  end="", flush=True)
+
+            df5 = self.all_data_5m.get(trade.symbol)
+            if df5 is None or df5.empty:
+                print("⚠  5m veri yok")
+                verified.append((trade, None, "5m veri yok"))
+                continue
+
+            try:
+                # entry_time = 4H bar open zamanı (UTC) = gerçek giriş anı
+                entry_ts = pd.Timestamp(
+                    datetime.strptime(trade.entry_time[:16], "%d.%m.%Y %H:%M"), tz="UTC"
+                )
+                # 4H exit zamanı: bitiş sınırı olarak kullan + 4H buffer
+                if trade.exit_time:
+                    exit_ts = pd.Timestamp(
+                        datetime.strptime(trade.exit_time[:16], "%d.%m.%Y %H:%M"), tz="UTC"
+                    ) + pd.Timedelta(hours=4)
+                else:
+                    exit_ts = entry_ts + pd.Timedelta(days=14)
+            except Exception:
+                print("⚠  zaman parse hatası")
+                verified.append((trade, None, "zaman parse hatası"))
+                continue
+
+            # Entry ile 4H exit arasındaki 5m mumları izole et
+            sub = df5[(df5.index >= entry_ts) & (df5.index <= exit_ts)]
+            if sub.empty:
+                print("⚠  izole edilecek 5m veri yok")
+                verified.append((trade, None, "5m veri boş"))
+                continue
+
+            # ── Simülasyon: HIGH-first, kötümser ─────────────────────
+            ep       = trade.entry_price
+            sl       = ep * (1 + sl_i / 100.0)
+            be_done  = False
+            tsl_on   = False
+            lowest   = 0.0
+            exit_info = None
+            _pos = trade.position_size_usdt
+            _lev = trade.leverage
+
+            def _pnl(xp: float, _ep=ep, _pos=_pos, _lev=_lev) -> float:
+                raw = _pos * _lev * (_ep - xp) / _ep
+                return round(max(raw, -_pos), 2)
+
+            # Büyük fark olasılığı için trace buffer (çıkışta karar veririz)
+            trace_buf = []
+
+            for ts5, b5 in sub.iterrows():
+                hi = b5["high"];  lo = b5["low"];  cl = b5["close"]
+                sl_before   = sl
+                tsl_was_on  = tsl_on   # bu bar başındaki TSL durumu
+
+                # Adım 1: HIGH >= mevcut SL → erken çıkış (BE/TSL henüz değişmeden)
+                if hi >= sl:
+                    reason = "5m_TSL_HIT" if tsl_on else "5m_SL_HIT"
+                    exit_info = {"exit_time": ts5.strftime("%d.%m.%Y %H:%M"),
+                                 "exit_price": sl, "exit_reason": reason,
+                                 "pnl_usdt": _pnl(sl)}
+                    trace_buf.append(f"    EXIT  {ts5.strftime('%H:%M')}  H={hi:.6f} L={lo:.6f} C={cl:.6f}  SL={sl:.6f}  → {reason}")
+                    break
+
+                # Adım 2: TSL aktivasyon / güncelleme — LOW bazlı
+                ld = (ep - lo) / ep * 100.0
+                if not tsl_on:
+                    if ld >= tsl_a:
+                        tsl_on = True;  lowest = lo
+                        sl = min(sl, lowest * (1 + tsl_t / 100.0))
+                        trace_buf.append(f"    TSL♻  {ts5.strftime('%H:%M')}  H={hi:.6f} L={lo:.6f} C={cl:.6f}  ld={ld:.1f}%  SL={sl_before:.6f}→{sl:.6f}  lowest={lowest:.6f}")
+                else:
+                    if lo < lowest:
+                        lowest = lo
+                        sl = min(sl, lowest * (1 + tsl_t / 100.0))
+                        trace_buf.append(f"    TSL↓  {ts5.strftime('%H:%M')}  H={hi:.6f} L={lo:.6f} C={cl:.6f}  SL={sl_before:.6f}→{sl:.6f}  lowest={lowest:.6f}")
+
+                # Adım 3: Breakeven — CLOSE bazlı
+                if not be_done:
+                    drop_cl = (ep - cl) / ep * 100.0
+                    if drop_cl >= be_p:
+                        sl = min(sl, ep)
+                        be_done = True
+                        trace_buf.append(f"    BE✓   {ts5.strftime('%H:%M')}  H={hi:.6f} L={lo:.6f} C={cl:.6f}  drop={drop_cl:.1f}%  SL={sl_before:.6f}→{sl:.6f}")
+
+                # Adım 4: TSL sonrası HIGH hit
+                # SADECE bar başında TSL zaten aktifse kontrol et.
+                # Bu bar içinde yeni aktifleşen TSL'nin SL seviyesi HIGH'tan SONRA
+                # oluştu (HIGH açılış civarında, LOW dip noktada) — aynı barda hit imkansız.
+                if tsl_was_on and hi >= sl:
+                    exit_info = {"exit_time": ts5.strftime("%d.%m.%Y %H:%M"),
+                                 "exit_price": sl, "exit_reason": "5m_TSL_HIT",
+                                 "pnl_usdt": _pnl(sl)}
+                    trace_buf.append(f"    EXIT  {ts5.strftime('%H:%M')}  H={hi:.6f} L={lo:.6f} C={cl:.6f}  SL={sl:.6f}  → 5m_TSL_HIT(A4)")
+                    break
+
+            if exit_info is None:
+                print("⚠  5m'de çıkış tetiklenmedi")
+            else:
+                icon = "✅" if exit_info["pnl_usdt"] > 0 else "🔴"
+                diff = exit_info["pnl_usdt"] - trade.pnl_usdt
+                warn = "  ⚠ BÜYÜK FARK" if abs(diff) > 100 else ""
+                print(f"{icon} {exit_info['exit_reason']:<12}  "
+                      f"Fiy: {exit_info['exit_price']:.6f}  "
+                      f"5m PnL: {exit_info['pnl_usdt']:>+8.2f}$  "
+                      f"Δ{diff:>+7.2f}${warn}")
+                # Büyük fark — bar-by-bar trace bas
+                if abs(diff) > 100 and trace_buf:
+                    print(f"    ┌── TRACE {sym_short} (entry={ep:.6f}  entry_ts={entry_ts})  "
+                          f"sub={len(sub)} bar  İlk bar: {sub.index[0].strftime('%d.%m %H:%M')} ──")
+                    for line in trace_buf:
+                        print(line)
+                    print(f"    └── sub son bar: {sub.index[-1].strftime('%d.%m %H:%M')}")
+            verified.append((trade, exit_info, None))
+
+        # ══════════════════════════════════════════════════════════════
+        # AŞAMA 3 — Karşılaştırmalı Rapor
+        # ══════════════════════════════════════════════════════════════
+        print("\n")
+        print("═" * 100)
+        print("  📋  AŞAMA 3 — KARŞILAŞTIRMALI RAPOR (df_4h_results  vs  df_5m_results)")
+        print("═" * 100)
+
+        rows_5m = []
+        total_bt_cand  = 0.0
+        total_5m_cand  = 0.0
+        valid_5m       = 0
+
+        print("\n  ┌" + "─"*(W-2) + "┐")
+        hdr = (f"  {'#':>3}  {'Sembol':<12}  {'Giriş Fiy':>11}  "
+               f"{'4H Çıkış Fiy':>13}  {'5m Çıkış Fiy':>13}  "
+               f"{'4H Neden':<13}  {'5m Neden':<13}  "
+               f"{'4H PnL':>10}  {'5m PnL':>10}  {'Δ':>9}")
+        print("  │" + hdr + " "*(W-2-len(hdr)) + "│")
+        print("  ├" + "─"*(W-2) + "┤")
+
+        for i, (trade, sim, err) in enumerate(verified, 1):
+            bt_pnl = trade.pnl_usdt
+            total_bt_cand += bt_pnl
+            sym = trade.symbol.replace("/USDT","").replace(":USDT","")
+
+            if sim is None:
+                note = err or "??"
+                row = (f"  {i:>3}  {sym:<12}  {trade.entry_price:>11.6f}  "
+                       f"{trade.exit_price:>13.6f}  {'N/A':>13}  "
+                       f"{trade.exit_reason:<13}  {'⚠ '+note:<13}  "
+                       f"{bt_pnl:>+10.2f}  {'N/A':>10}  {'N/A':>9}")
+                rows_5m.append({"Sembol": sym, "4H_PnL": bt_pnl, "5m_PnL": None,
+                                 "4H_Neden": trade.exit_reason, "5m_Neden": note})
+            else:
+                s_pnl = sim["pnl_usdt"]
+                diff  = s_pnl - bt_pnl
+                flag  = " ⚠" if abs(diff) > 100 else "  "
+                total_5m_cand += s_pnl
+                valid_5m      += 1
+                row = (f"  {i:>3}  {sym:<12}  {trade.entry_price:>11.6f}  "
+                       f"{trade.exit_price:>13.6f}  {sim['exit_price']:>13.6f}  "
+                       f"{trade.exit_reason:<13}  {sim['exit_reason']:<13}  "
+                       f"{bt_pnl:>+10.2f}  {s_pnl:>+10.2f}  {diff:>+9.2f}{flag}")
+                rows_5m.append({"Sembol": sym, "4H_PnL": bt_pnl, "5m_PnL": s_pnl,
+                                 "4H_Neden": trade.exit_reason, "5m_Neden": sim["exit_reason"],
+                                 "Δ_PnL": diff})
+            print("  │" + row + " "*(W-2-len(row)) + "│")
+
+        print("  ├" + "═"*(W-2) + "┤")
+        foot = (f"  {'TOPLAM filtreli (' + str(valid_5m) + '/' + str(len(verified)) + ' 5m veri)':<42}"
+                f"{'':>41}  {total_bt_cand:>+10.2f}  {total_5m_cand:>+10.2f}  {(total_5m_cand-total_bt_cand):>+9.2f}")
+        print("  │" + foot + " "*(W-2-len(foot)) + "│")
+        print("  └" + "─"*(W-2) + "┘")
+
+        # ── 5m performans metrikleri ───────────────────────────────────
+        # Zarar eden ve TSL-HIT olmayan tradeler (5m filtresi dışında kalanlar)
+        loss_sum = sum(t.pnl_usdt for t in self.trades
+                       if t.pnl_usdt <= 0 and t.exit_reason != "TSL-HIT")
+        net_5m   = total_5m_cand + loss_sum
+        net_bt   = sum(t.pnl_usdt for t in self.trades)
+        capital  = getattr(self, "capital", 1000.0) or 1000.0
+
+        # 5m doğrulanmış tüm işlemler (geçerli sim olanlar)
+        pnl_list_5m = []
+        for trade, sim, _ in verified:
+            if sim is not None:
+                pnl_list_5m.append(sim["pnl_usdt"])
+            # 5m verisi olmayanlar 4H PnL ile kalır (loss_sum içinde zaten)
+
+        # Zarar eden (5m filtre dışı) tradelerin PnL listesi
+        pnl_losses_excl = [t.pnl_usdt for t in self.trades
+                           if t.pnl_usdt <= 0 and t.exit_reason != "TSL-HIT"]
+        all_pnl_5m = pnl_list_5m + pnl_losses_excl
+
+        total_t   = len(all_pnl_5m)
+        win_5m    = [p for p in all_pnl_5m if p > 0]
+        lose_5m   = [p for p in all_pnl_5m if p <= 0]
+        gross_p   = sum(win_5m)
+        gross_l   = sum(lose_5m)
+        pf        = (gross_p / abs(gross_l)) if gross_l != 0 else float("inf")
+        avg_win   = (gross_p / len(win_5m))  if win_5m  else 0.0
+        avg_los   = (gross_l / len(lose_5m)) if lose_5m else 0.0
+        wr        = (len(win_5m) / total_t * 100) if total_t else 0.0
+        eq_5m     = capital + net_5m
+        ret_5m    = (net_5m / capital * 100)
+        icon_net  = "🟢" if net_5m >= 0 else "🔴"
+
+        print()
+        print("  ┌─────────────────────────────────────────────────────────────────┐")
+        print("  │  📊  5m DOĞRULAMA SONUÇ TABLOSU                                 │")
+        print("  ├─────────────────────────────────────────────────────────────────┤")
+        print(f"  │  Başlangıç Sermayesi  : {capital:>12,.2f} USDT                       │")
+        print(f"  │  Son Öz-Varlık (5m)   : {eq_5m:>12,.2f} USDT                       │")
+        print(f"  │  Toplam Getiri (5m)   : {ret_5m:>+11.2f} %                          │")
+        print("  ├─────────────────────────────────────────────────────────────────┤")
+        print(f"  │  Toplam Trade         : {total_t:>12,}                               │")
+        print(f"  │  Kazanan              : {len(win_5m):>12,}   ({wr:.1f}%)                  │")
+        print(f"  │  Kaybeden             : {len(lose_5m):>12,}   ({100-wr:.1f}%)                  │")
+        print("  ├─────────────────────────────────────────────────────────────────┤")
+        print(f"  │  Brüt Kâr             : {gross_p:>+12.2f} USDT                       │")
+        print(f"  │  Brüt Zarar           : {gross_l:>+12.2f} USDT                       │")
+        print(f"  │  Net PnL (5m)         : {net_5m:>+12.2f} USDT                       │")
+        print("  ├─────────────────────────────────────────────────────────────────┤")
+        print(f"  │  Profit Factor        : {pf:>12.2f}                               │")
+        print(f"  │  Ort. Kazanç/Trade    : {avg_win:>+12.2f} USDT                       │")
+        print(f"  │  Ort. Kayıp/Trade     : {avg_los:>+12.2f} USDT                       │")
+        print("  ├─────────────────────────────────────────────────────────────────┤")
+        print(f"  │  4H Net PnL           : {net_bt:>+12.2f} USDT                       │")
+        print(f"  │  5m Net PnL           : {net_5m:>+12.2f} USDT                       │")
+        print(f"  │  Fark (5m – 4H)       : {(net_5m - net_bt):>+12.2f} USDT                       │")
+        print("  ├─────────────────────────────────────────────────────────────────┤")
+        print(f"  │  {icon_net}  SONUÇ (5m gerçekçi)  : {net_5m:>+12.2f} USDT                       │")
+        print("  └─────────────────────────────────────────────────────────────────┘")
+        print("\n" + "═" * 100)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2225,9 +2924,10 @@ class FullUniverseBacktester:
 
     def __init__(self, days: int = None, initial_capital: float = None,
                  start_dt: datetime = None, end_dt: datetime = None):
-        self.capital   = initial_capital or Config.BACKTEST_INITIAL_CAPITAL  # 100
-        self.exchange  = None
-        self.all_data: Dict[str, pd.DataFrame] = {}             # sym → 4H DataFrame
+        self.capital     = initial_capital or Config.BACKTEST_INITIAL_CAPITAL  # 100
+        self.exchange    = None
+        self.all_data:    Dict[str, pd.DataFrame] = {}   # sym → 4H DataFrame
+        self.all_data_5m: Dict[str, pd.DataFrame] = {}  # sym → 5m DataFrame (sadece kazanılan tradeler)
         self.trades: List[TradeRecord] = []
         self.equity_curve: List[float] = []
         self.universe: List[str] = []
@@ -2323,6 +3023,88 @@ class FullUniverseBacktester:
         return df
 
     # ─────────────────────────────────────────────────────────────────
+    # C2) Tek sembol için 5m verisi indır
+    # ─────────────────────────────────────────────────────────────────
+    async def _fetch_5m(self, symbol: str) -> pd.DataFrame:
+        since_ms = int(self.start_dt.timestamp() * 1000)
+        until_ms = int(self.end_dt.timestamp() * 1000)
+        candles: list = []
+        cur = since_ms
+        while True:
+            try:
+                batch = await self.exchange.fetch_ohlcv(symbol, '5m', since=cur, limit=1000)
+            except Exception as e:
+                log.warning(f"  {symbol} 5m hata: {e}")
+                break
+            if not batch:
+                break
+            candles.extend(batch)
+            last_ts = batch[-1][0]
+            if last_ts >= until_ms or len(batch) < 1000:
+                break
+            cur = last_ts + 1
+            await asyncio.sleep(0.15)
+        if not candles:
+            return pd.DataFrame()
+        df = pd.DataFrame(candles, columns=["timestamp","open","high","low","close","volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df.drop_duplicates(subset="timestamp", inplace=True)
+        df.sort_values("timestamp", inplace=True)
+        df.set_index("timestamp", inplace=True)
+        return df
+
+    async def fetch_winning_5m(self):
+        """
+        Backtest bittikten sonra KÂRLI veya TSL-HIT tradelerin sembollerinin
+        5m verisini çek. Tüm universe yerine yalnızca gerekli semboller → hızlı.
+        Filtre: pnl_usdt > 0 VEYA exit_reason == 'TSL-HIT'
+        """
+        winners = [t for t in self.trades if t.pnl_usdt > 0 or t.exit_reason == "TSL-HIT"]
+        if not winners:
+            return
+        syms = list(dict.fromkeys(t.symbol for t in winners))  # sıra koruyarak unique
+        print(f"\n  📥 5m doğrulama için {len(syms)} sembol çekiliyor: "
+              f"{', '.join(s.replace('/USDT','').replace(':USDT','') for s in syms)} ...")
+        exchange = _make_binance_exchange()
+        for sym in syms:
+            df5 = await self._fetch_5m_via(exchange, sym)
+            if not df5.empty:
+                self.all_data_5m[sym] = df5
+                print(f"  ✔ {sym.replace('/USDT','').replace(':USDT','')}: {len(df5)} adet 5m mum")
+            else:
+                print(f"  ⚠ {sym}: 5m veri boş")
+        await exchange.close()
+        print()
+
+    async def _fetch_5m_via(self, exchange, symbol: str) -> pd.DataFrame:
+        since_ms = int(self.start_dt.timestamp() * 1000)
+        until_ms = int(self.end_dt.timestamp() * 1000)
+        candles: list = []
+        cur = since_ms
+        while True:
+            try:
+                batch = await exchange.fetch_ohlcv(symbol, '5m', since=cur, limit=1000)
+            except Exception as e:
+                log.warning(f"  {symbol} 5m hata: {e}")
+                break
+            if not batch:
+                break
+            candles.extend(batch)
+            last_ts = batch[-1][0]
+            if last_ts >= until_ms or len(batch) < 1000:
+                break
+            cur = last_ts + 1
+            await asyncio.sleep(0.15)
+        if not candles:
+            return pd.DataFrame()
+        df = pd.DataFrame(candles, columns=["timestamp","open","high","low","close","volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df.drop_duplicates(subset="timestamp", inplace=True)
+        df.sort_values("timestamp", inplace=True)
+        df.set_index("timestamp", inplace=True)
+        return df
+
+    # ─────────────────────────────────────────────────────────────────
     # D) Tüm universe için veri indir (batch — rate-limit dostu)
     # ─────────────────────────────────────────────────────────────────
     async def load_data(self):
@@ -2395,7 +3177,8 @@ class FullUniverseBacktester:
         print(f"  Sermaye    : {self.capital:.2f}$")
         print(f"  Kaldıraç   : x{Config.LEVERAGE}")
         print(f"  Max Trade  : {Config.MAX_ACTIVE_TRADES}  (aynı anda)")
-        print(f"  Risk/Trade : %{Config.RISK_PER_TRADE_PCT}  ({self.capital * Config.RISK_PER_TRADE_PCT / 100:.2f}$ başlangıç)")
+        risk_pct = Config.risk_per_trade_pct()
+        print(f"  Risk/Trade : %{risk_pct}  ({self.capital * risk_pct / 100:.2f}$ başlangıç)")
         print(f"  Sembol     : {len(self.all_data)} adet")
         print(f"  Dönem      : {self.start_dt.strftime('%d.%m.%Y')} → {self.end_dt.strftime('%d.%m.%Y')} (4H barlar)")
         print("=" * 68)
@@ -2444,34 +3227,12 @@ class FullUniverseBacktester:
                     continue
                 bar = df.loc[ts]
 
-                # Stage 1: Breakeven — %4 düşüşte SL = entry
-                if not trade.breakeven_triggered:
-                    drop_pct = (trade.entry_price - bar["close"]) / trade.entry_price * 100.0
-                    if drop_pct >= be_price_drop_pct:
-                        trade.stop_loss = trade.entry_price
-                        trade.sl_moved_to_be = True
-                        trade.breakeven_triggered = True
-                        print(f"\n  [{bar_str}] ⚡ BE {sym:<16}"
-                              f" Düşüş: %{drop_pct:.1f}")
-
-                # Stage 2: TSL — %8 düşüşte aktif, SL = lowest_low × 1.03
-                low_drop_pct = (trade.entry_price - bar["low"]) / trade.entry_price * 100.0
-                if not trade.tsl_active:
-                    if low_drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
-                        trade.tsl_active = True
-                        trade.lowest_low_reached = bar["low"]
-                        new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
-                        trade.stop_loss = min(trade.stop_loss, new_sl)
-                        print(f"\n  [{bar_str}] 🎯 TSL-AKT {sym:<14}"
-                              f" Low: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
-                else:
-                    if bar["low"] < trade.lowest_low_reached:
-                        trade.lowest_low_reached = bar["low"]
-                        new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
-                        trade.stop_loss = min(trade.stop_loss, new_sl)
-
-                # Stage 3: SL kontrolü (HIGH-BASED)
-                # Exchange stop_market emri mum içi HIGH stop fiyatına değer değmez tetiklenir
+                # ── KURAL 1: ÖNCE STOP KONTROLÜ (En Kötü Senaryo) ────
+                # 4H mum içinde fiyatın önce nereye gittiğini bilemeyiz.
+                # Gerçek exchange'de stop_market emri HIGH'a değer değmez
+                # tetiklenir; LOW'daki TSL aktivasyonundan ÖNCE gelmiş olabilir.
+                # Bu yüzden HIGH stop'a değdiyse → TSL/BE hesabına bakmadan
+                # direkt zarar ile kapat. Sahte kârlı TSL çıkışını engeller.
                 if bar["high"] >= trade.stop_loss:
                     exit_p  = trade.stop_loss
                     raw_pnl = (trade.entry_price - exit_p) / trade.entry_price
@@ -2495,7 +3256,67 @@ class FullUniverseBacktester:
                           f"  Equity: {equity:.4f}$")
                     continue
 
-                # Stage 4: Zararda yeşil mum → SHORT kapat
+                # ── KURAL 2: TSL VE BE HESAPLAMASI ───────────────────
+                # HIGH stop'a değmediyse fiyat güvenli bölgededir.
+                # Artık bar["low"] bazlı Breakeven ve Trailing Stop
+                # güncellemelerini güvenle yapabiliriz.
+
+                # Breakeven — %BE_DROP düşüşte SL = entry
+                if not trade.breakeven_triggered:
+                    drop_pct = (trade.entry_price - bar["close"]) / trade.entry_price * 100.0
+                    if drop_pct >= be_price_drop_pct:
+                        trade.stop_loss = trade.entry_price
+                        trade.sl_moved_to_be = True
+                        trade.breakeven_triggered = True
+                        print(f"\n  [{bar_str}] ⚡ BE {sym:<16}"
+                              f" Düşüş: %{drop_pct:.1f}")
+
+                # TSL aktivasyonu ve güncelleme (low bazlı)
+                low_drop_pct = (trade.entry_price - bar["low"]) / trade.entry_price * 100.0
+                if not trade.tsl_active:
+                    if low_drop_pct >= Config.TSL_ACTIVATION_DROP_PCT:
+                        trade.tsl_active = True
+                        trade.lowest_low_reached = bar["low"]
+                        new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
+                        trade.stop_loss = min(trade.stop_loss, new_sl)
+                        print(f"\n  [{bar_str}] 🎯 TSL-AKT {sym:<14}"
+                              f" Low: {trade.lowest_low_reached:.6f}  SL → {trade.stop_loss:.6f}")
+                else:
+                    if bar["low"] < trade.lowest_low_reached:
+                        trade.lowest_low_reached = bar["low"]
+                        new_sl = trade.lowest_low_reached * (1 + Config.TSL_TRAIL_PCT / 100.0)
+                        trade.stop_loss = min(trade.stop_loss, new_sl)
+
+                # ── KURAL 3: MUM İÇİ BOUNCE (SEKME) KONTROLÜ ─────────
+                # TSL aktifleşti/güncellendi ve yeni bir stop belirlendi.
+                # Mum kapanışı bu yeni stop seviyesinin ÜSTÜNDE kaldıysa
+                # fiyat dip yapıp sekerken TSL'i patlatmış demektir → kapat.
+                # (Kural 1'den farkı: burada HIGH değil CLOSE kullanılır;
+                #  çünkü stop yeni OLUŞTU ve close zaten üstte kapandı.)
+                if trade.tsl_active and bar["close"] >= trade.stop_loss:
+                    exit_p  = trade.stop_loss
+                    raw_pnl = (trade.entry_price - exit_p) / trade.entry_price
+                    pnl_usd = trade.position_size_usdt * trade.leverage * raw_pnl
+                    pnl_usd = max(pnl_usd, -trade.position_size_usdt)  # Max kayıp = margin
+                    trade.exit_time   = bar_str
+                    trade.exit_price  = exit_p
+                    trade.exit_reason = "TSL-HIT"
+                    trade.pnl_pct     = round(raw_pnl * 100, 4)
+                    trade.pnl_usdt    = round(pnl_usd, 4)
+                    equity += pnl_usd
+                    self.equity_curve.append(equity)
+                    self.trades.append(trade)
+                    closed.append(sym)
+                    consumed_signals.discard(sym)  # Çıkış sonrası yeniden girişe izin ver
+                    post_exit_price[sym] = exit_p
+                    new_push[sym] = False
+                    print(f"\n  [{bar_str}] 🎯 TSL-HIT (bounce) {sym:<12}"
+                          f" exit: {exit_p:.6f}  PnL: {pnl_usd:>+8.4f}$"
+                          f"  Equity: {equity:.4f}$")
+                    continue
+
+                # ── KURAL 4: ZARARDA YEŞİL MUM (GREEN-10) ────────────
+                # Kural 1-3 atlatıldıysa trade hâlâ açık; yeşil mum kontrolü yap.
                 if bar["close"] > bar["open"] and bar["close"] > trade.entry_price:
                     green_body_pct = (bar["close"] - bar["open"]) / bar["open"] * 100.0
                     # Zararda tek yeşil mum gövdesi >= %10 → anında kapat (reversal olmadı)
@@ -2573,12 +3394,14 @@ class FullUniverseBacktester:
                 if green_count < Config.PUMP_MIN_GREEN_COUNT:  # 4
                     continue
 
-                # Koşul 2: 1. mumun dibi → 6. mumun kapanışı net kazanımı >= %30
-                # (detect_pump_at_bar ile aynı formül — tutarlılık için)
+                # Koşul 2: pencere başlangıcının gövde tabanı → mevcut barın kapanışı >= PUMP_MIN_PCT
                 pump_high      = max(c["high"] for c in window)
-                pump_start_low = window[0]["low"]
-                current_close  = window[-1]["close"]
-                net_gain_pct   = (current_close - pump_start_low) / pump_start_low * 100.0
+                pump_start_low = window[0]["low"]   # Rapor/SL referansı için saklanır
+                pump_start_ref = min(window[0]["open"], window[0]["close"])  # Gövde tabanı (wick dahil değil)
+                current_close  = df.iloc[ts_idx]["close"]
+                if pump_start_ref <= 0:
+                    continue
+                net_gain_pct   = (current_close - pump_start_ref) / pump_start_ref * 100.0
                 if net_gain_pct < Config.PUMP_MIN_PCT:
                     continue
 
@@ -2651,7 +3474,20 @@ class FullUniverseBacktester:
                 # Solid Red: gövde en az %X düşüş olmalı (doji filtresi)
                 red_body_pct = (bar["open"] - bar["close"]) / bar["open"] * 100.0
 
-                entry_p = bar["close"]
+                # GERÇEKÇİ GİRİŞ: sinyal barı kapanınca market order → sonraki 5m open
+                _entry_ts_fu = ts + pd.Timedelta(hours=4)
+                _df5m_fu     = getattr(self, "all_data_5m", {}).get(sym)
+                if _df5m_fu is not None and _entry_ts_fu in _df5m_fu.index:
+                    entry_p    = _df5m_fu.loc[_entry_ts_fu]["open"]
+                    entry_time_fu = _entry_ts_fu.strftime("%d.%m.%Y %H:%M")
+                else:
+                    _ts_idx_e  = df.index.get_loc(ts)
+                    if _ts_idx_e + 1 < len(df):
+                        entry_p    = df.iloc[_ts_idx_e + 1]["open"]
+                        entry_time_fu = df.index[_ts_idx_e + 1].strftime("%d.%m.%Y %H:%M")
+                    else:
+                        entry_p    = bar["close"]
+                        entry_time_fu = bar_str
 
                 # Module 2b: Pump zirvesinin altına düşmeli (peak geçildi teyidi)
                 if entry_p >= pump_info["pump_high"]:
@@ -2662,7 +3498,6 @@ class FullUniverseBacktester:
                 # Gövde küçükse (≤%2) sinyal yanmaz, bir sonraki kırmızı mumda tekrar değerlendirilir
                 if red_body_pct < Config.ENTRY_RED_BODY_MIN_PCT:
                     continue  # Cılız kırmızı: bekle, sinyal yanmadı
-
                 # Önceki mum yeşil ve gövdesi max %30 olmalı (sahte kırmızı filtresi)
                 _ts_idx = df.index.get_loc(ts)
                 if _ts_idx == 0:
@@ -2699,7 +3534,7 @@ class FullUniverseBacktester:
                 trade = TradeRecord(
                     symbol             = sym,
                     side               = "SHORT",
-                    entry_time         = bar_str,
+                    entry_time         = entry_time_fu,
                     entry_price        = entry_p,
                     stop_loss          = sl,
                     initial_stop_loss  = sl,
@@ -2710,15 +3545,15 @@ class FullUniverseBacktester:
                     pump_pct           = pump_info["pump_pct"],
                     pump_high          = pump_info["pump_high"],
                     pump_low           = pump_info["pump_low"],
-                    entry_candle_open  = bar["open"],
+                    entry_candle_open  = entry_p,
                     leverage           = lev,
                 )
                 active[sym] = trade
                 max_concurrent = max(max_concurrent, len(active))
 
-                print(f"\n  [{bar_str}] ✅ SHORT {sym:<16}"
+                print(f"\n  [{entry_time_fu}] ✅ SHORT {sym:<16}"
                       f" Giriş: {entry_p:.6f}  SL: {sl:.6f}"
-                      f"  Pump: +{pump_info['pump_pct']:.1f}%")
+                      f"  Pump: +{pump_info['pump_pct']:.1f}%  [Sinyal: {bar_str}]")
 
         # ── Backtest sonu: açık trade'leri kapat ─────────────────────
         print("\n\n  ── Açık kalan tradeler kapatılıyor (BT-END) ──")
@@ -2771,6 +3606,15 @@ class FullUniverseBacktester:
         _dummy.days         = _days
         _dummy.all_data     = self.all_data
         Backtester.print_report(_dummy)
+
+    def verify_profits_5m(self):
+        """FullUniverse için 5m doğrulama — Backtester.verify_profits_5m'i yeniden kullanır."""
+        _dummy = Backtester.__new__(Backtester)
+        _dummy.trades       = self.trades
+        _dummy.equity_curve = self.equity_curve
+        _dummy.capital      = self.capital
+        _dummy.all_data_5m  = getattr(self, "all_data_5m", {})
+        Backtester.verify_profits_5m(_dummy)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2834,6 +3678,11 @@ async def main_backtest(full_universe: bool = False,
     await bt.load_data()
     bt.run_backtest()
     bt.print_report()
+    # Kârlı tradeler 5m ile yeniden doğrula
+    # FullUniverse: önce yalnızca kazanılan tradeler için 5m çek
+    if full_universe and hasattr(bt, 'fetch_winning_5m'):
+        await bt.fetch_winning_5m()
+    bt.verify_profits_5m()
 
 
 async def main_live():
